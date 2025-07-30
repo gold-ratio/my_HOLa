@@ -1817,12 +1817,12 @@ class UPT(nn.Module):
                         loss_dict = dict(interaction_loss=interaction_loss)
                 else:
                     loss_dict = dict(interaction_loss=interaction_loss)
-
+                
                 if interaction_loss.isnan():
                     pdb.set_trace()
 
                 if self.basis_feat_enable is True and self.fix_mem is False:
-                    temp_hoicls_w = self.hoicls_w.clone().detach()
+                    temp_hoicls_w = self.hoicls_w
                     loss_dict['recon_loss2'] = self.recon_loss2(temp_hoicls_w @ self.basis_feat, self.hoicls_txt.to(self.basis_feat.device)) * 0.1
                     if self.wo_sparsity is False:
                         loss_dict['loss_w_sparse'] = (torch.abs(self.hoicls_w)).sum(-1).mean(0) * 0.1 
@@ -1873,7 +1873,7 @@ class UPT(nn.Module):
              
 
                     if self.ao_sep_basis is True:
-                        temp_actcls_w = self.actcls_w.clone().detach()
+                        temp_actcls_w = self.actcls_w
                         if self.basis_feat_constraint == 'none':
                             loss_dict['recon_loss2_act'] = self.recon_loss2(temp_actcls_w @ self.basis_feat[self.act_related_index], self.origin_text_embeddings.to(self.basis_feat.device)) * 0.1
                         else:
@@ -1942,7 +1942,9 @@ class UPT(nn.Module):
                                     loss_dict['loss_actw_similar2'] = loss_dict['loss_actw_similar2'] + kl_loss(adapted_weight_human[rare_list], act_weight[rare_list], T=self.kl_t) * 50
 
 
-                        
+                # print(sum(loss for loss in loss_dict.values()))
+                # print(loss_dict)
+                # import pdb; pdb.set_trace()
                 return loss_dict
   
             if len(logits) == 0:
