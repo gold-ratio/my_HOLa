@@ -381,7 +381,7 @@ class CustomisedDLE(DistributedLearningEngine):
         self._start_epoch = start_epoch
         # self.scaler = amp.GradScaler(enabled=True)
 
-    def _on_each_iteration(self, epoch):
+    def _on_each_iteration(self):
         # with amp.autocast(enabled=True):
         loss_dict = self._state.net(
             *self._state.inputs, targets=self._state.targets)
