@@ -1,5 +1,5 @@
 ftfy
 regex
 tqdm
-torch
-torchvision
+# torch
+# torchvision

@@ -1,95 +1,77 @@
-# [ICCV 2025] HOLa: Zero-Shot HOI Detection with Low-Rank Decomposed VLM Feature Adaptation
+# [ICCV 2025] HOLa: 基于低秩分解 VLM 特征适应的零样本 HOI 检测
 
-## Paper Links
+## 论文链接
+[arXiv](https://arxiv.org/abs/2507.15542)
+[项目页面](https://chelsielei.github.io/HOLa_Proj/)
 
-[arXiv](https://arxiv.org/abs/2507.15542) 
-
-[Project Page](https://chelsielei.github.io/HOLa_Proj/)
-
-
-
-
-## Dataset 
-Follow the process of [UPT](https://github.com/fredzzhang/upt).
-
-The downloaded files should be placed as follows. Otherwise, please replace the default path to your custom locations.
+## 数据集
+请遵循 [UPT](https://github.com/fredzzhang/upt) 的流程。
+下载的文件应按以下方式放置。否则，请将默认路径替换为您自定义的位置。
 ```
 |- HOLa
-|   |- hicodet
-|   |   |- hico_20160224_det
-|   |       |- annotations
-|   |       |- images
-|   |- vcoco
-|   |   |- mscoco2014
-|   |       |- train2014
-|   |       |-val2014
-:   :      
+|   |- hicodet
+|   |   |- hico_20160224_det
+|   |       |- annotations
+|   |       |- images
+|   |- vcoco
+|   |   |- mscoco2014
+|   |       |- train2014
+|   |       |-val2014
+:   :      
 ```
 
-## Dependencies
-1. Follow the environment setup in [UPT](https://github.com/fredzzhang/upt).
-
-2. Follow the environment setup in [ADA-CM](https://github.com/ltttpku/ADA-CM/tree/main).
-
-**Reminder**: 
-If you have already installed the clip package in your Python environment (e.g., via pip install clip), please ensure that you use the local CLIP directory provided in our EZ-HOI repository instead. To do this, set the  `PYTHONPATH` to include the local CLIP path so that it takes precedence over the installed package.
+## 依赖
+1.  遵循 [UPT](https://github.com/fredzzhang/upt) 中的环境设置。
+2.  遵循 [ADA-CM](https://github.com/ltttpku/ADA-CM/tree/main) 中的环境设置。
+**提醒**：
+如果您已经在 Python 环境中安装了 `clip` 软件包（例如，通过 `pip install clip`），请确保使用我们 EZ-HOI 仓库中提供的本地 CLIP 目录。为此，请设置 `PYTHONPATH` 以包含本地 CLIP 路径，使其优先于已安装的软件包。
 ```
 export PYTHONPATH=$PYTHONPATH:"your_path/HOLa/CLIP"
 ```
-So that you can use the local clip **without uninstall the clip of your python env**.
+这样您就可以使用本地 `clip` **而无需卸载您 Python 环境中的 `clip`**。
 
-3. modify the installed [pocket](https://github.com/fredzzhang/pocket) library as mentioned [here](https://github.com/ChelsieLei/EZ-HOI/issues/2)
-
-## Scripts
-### Train / Test on HICO-DET:
-
-Using vit-B image backbone:
+3.  按照 [这里](https://github.com/ChelsieLei/EZ-HOI/issues/2) 提到的修改已安装的 [pocket](https://github.com/fredzzhang/pocket) 库。
+## 脚本
+### 在 HICO-DET 上训练/测试：
+使用 **vit-B** 图像骨干网络：
 ```
 bash scripts/hico_vitB.sh
 ```
-
-Using vit-L image backbone:
+使用 **vit-L** 图像骨干网络
 ```
 bash scripts/hico_vitL.sh
 ```
-
-
-### Train / Test on V-COCO:
-
-Using vit-L image backbone:
+### 在 V-COCO 上训练/测试：
+使用 **vit-L** 图像骨干网络：
 ```
 bash scripts/vcoco.sh
 ```
 
+## 模型库
+| 数据集 | 设置 | 骨干网络 | mAP | Unseen | Seen |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| HICO-DET | UV | ResNet-50+ViT-B | 34.09 | 27.91 | 35.09 |
+| HICO-DET | RF | ResNet-50+ViT-B | 34.19 | 30.61 | 35.08 |
+| HICO-DET | NF | ResNet-50+ViT-B | 32.36 | 35.25 | 31.64 |
+| HICO-DET | UO | ResNet-50+ViT-B | 33.59 | 36.45 | 33.02 |
 
-## Model Zoo
+| 数据集 | 设置 | 骨干网络 | mAP | Rare | Non-rare |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| HICO-DET | default | ResNet-50+ViT-B | 35.41 | 34.35 | 35.73 |
+| HICO-DET | default | ResNet-50+ViT-L | 39.05 | 38.66 | 39.17 |
 
-| Dataset | Setting| Backbone  | mAP | Unseen | Seen |
-| ---- |  ----  | ----  | ----  | ----  | ----  |
-| HICO-DET | UV | ResNet-50+ViT-B  | 34.09|27.91|35.09|
-| HICO-DET | RF| ResNet-50+ViT-B  | 34.19 |30.61|35.08|
-| HICO-DET | NF| ResNet-50+ViT-B  | 32.36|35.25|31.64|
-| HICO-DET | UO| ResNet-50+ViT-B  | 33.59|36.45|33.02|
-
-| Dataset | Setting| Backbone  | mAP | Rare | Non-rare |
-| ---- |  ----  | ----  | ----  | ----  | ----  |
-| HICO-DET |default| ResNet-50+ViT-B  | 35.41|34.35|35.73|
-| HICO-DET |default| ResNet-50+ViT-L  | 39.05|38.66|39.17|
-
-
-You can download our pretrained model checkpoints using the following link from Google Drive:  
+您可以使用以下 Google Drive 链接下载我们预训练的模型检查点：
 ```
 https://drive.google.com/drive/folders/1kH-yOi-YqdB35rSgKoRkmg_pGbyFEkUX?usp=sharing
 ```
-
-You can also download our pretrained model checkpoints using the following Kuake link:  
+您也可以使用以下夸克链接下载我们预训练的模型检查点：
 ```
-Link: https://pan.quark.cn/s/c3f30b122ed2 
-Extraction code: yawa
+链接: https://pan.quark.cn/s/c3f30b122ed2
+提取码: yawa
 ```
 
-## Citation
-If you find our paper and/or code helpful, please consider citing :
+## 引用
+如果您觉得我们的论文和/或代码有所帮助，请考虑引用：
 ```
 @inproceedings{
 lei2025hola,
@@ -99,12 +81,6 @@ booktitle={In Proceedings of the IEEE/CVF international conference on computer v
 year={2025}
 }
 ```
-
-## Acknowledgement
-We gratefully thank the authors from [UPT](https://github.com/fredzzhang/upt) and [ADA-CM](https://github.com/ltttpku/ADA-CM/tree/main) for open-sourcing their code.
-
-
-
-
-
-
+## 致谢
+我们衷心感谢 [UPT](https://github.com/fredzzhang/upt) 和 [ADA-CM](https://github.com/ltttpku/ADA-CM/tree/main) 的作者们开源了他们的代码。
+-----

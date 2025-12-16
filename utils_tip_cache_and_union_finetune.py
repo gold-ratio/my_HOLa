@@ -23,17 +23,14 @@ from tqdm import tqdm
 from collections import defaultdict
 from torch.utils.data import Dataset
 
-from vcoco.vcoco import VCOCO
 from hicodet.hicodet import HICODet
 from hico_text_label import hico_unseen_index, HOI_TO_AO, ACT_IDX_TO_ACT_NAME, obj_to_name, OBJ_IDX_TO_COCO_ID, MAP_AO_TO_HOI
-from vcoco_text_label import MAP_AO_TO_HOI_COCO
 import sys
 sys.path.append('../pocket/pocket')
 import pocket
 from pocket.core import DistributedLearningEngine
 from pocket.utils import DetectionAPMeter, BoxPairAssociation
 
-import sys
 sys.path.append('detr')
 import detr.datasets.transforms_clip as T
 import pdb
@@ -49,18 +46,14 @@ import cv2
 import random
 import matplotlib.pyplot as plt
 from sklearn.manifold import TSNE
-import pickle
 
+#将一个批次的数据项从列表中转换成两个独立的列表
 def custom_collate(batch):
     images = []
     targets = []
-    # images_clip = []
-    
     for im, tar in batch:
         images.append(im)
         targets.append(tar)
-        
-        # images_clip.append(im_clip)
     return images, targets
 
 class DataFactory(Dataset):
@@ -90,20 +83,6 @@ class DataFactory(Dataset):
                 )
                 self.dataset = self.dataset + self.syndataset
 
-        else:
-            assert partition in ['train', 'val', 'trainval', 'test'], \
-                "Unknown V-COCO partition " + partition
-            image_dir = dict(
-                train='mscoco2014/train2014',
-                val='mscoco2014/train2014',
-                trainval='mscoco2014/train2014',
-                test='mscoco2014/val2014'
-            )
-            self.dataset = VCOCO(
-                root=os.path.join(data_root, image_dir[partition]),
-                anno_file=os.path.join(data_root, 'instances_vcoco_{}.json'.format(partition)
-                ), target_transform=pocket.ops.ToTensor(input_format='dict')
-            )
         # add clip normalization
         self.normalize = T.Compose([
             T.ToTensor(),
@@ -179,10 +158,8 @@ class DataFactory(Dataset):
                     if corr[0] not in self.filtered_hoi_idx:
                         self.zs_object_to_target[corr[1]].append(corr[2])        
 
-        
     def __len__(self):
         return len(self.keep)
-        return len(self.dataset)
 
     # train detr with roi
     def __getitem__(self, i):
@@ -225,16 +202,6 @@ class DataFactory(Dataset):
         target['filename'] = filename
 
         return (image,image_clip), target
-        image_0, target_0 = self.transforms[0](image, target)
-        image, _ = self.transforms[1](image_0, None)
-
-        target_0['valid_size'] = torch.as_tensor(image.shape[-2:])
-        image_clip, target = self.transforms[3](image_0, target_0) # resize 
-        image_clip, target = self.transforms[2](image_clip, target) # normlize
-        if image_0.size[-1] >1344 or image_0.size[-2] >1344:print(image_0.size)
-        target['filename'] = filename
-
-        return (image,image_clip), target
 
     def expand2square(self, pil_img, background_color):
         width, height = pil_img.size
@@ -254,8 +221,6 @@ class DataFactory(Dataset):
         min_instances = 3
         max_instances = 15
         region_props = []
-        # for res in results:
-        # pdb.set_trace()
         bx = results['ex_bbox']
         sc = results['ex_scores']
         lb = results['ex_labels']
@@ -273,8 +238,6 @@ class DataFactory(Dataset):
             keep_h = sc[hum].argsort(descending=True)[:max_instances]
             keep_h = hum[keep_h]
         else:
-            # keep_h = torch.nonzero(is_human[keep]).squeeze(1)
-            # keep_h = keep[keep_h]
             keep_h = hum
 
         if n_object < min_instances:
@@ -284,8 +247,6 @@ class DataFactory(Dataset):
             keep_o = sc[obj].argsort(descending=True)[:max_instances]
             keep_o = obj[keep_o]
         else:
-            # keep_o = torch.nonzero(is_human[keep] == 0).squeeze(1)
-            # keep_o = keep[keep_o]
             keep_o = obj
 
         keep = torch.cat([keep_h, keep_o])
@@ -307,12 +268,6 @@ class DataFactory(Dataset):
         # Skip image when there are no valid human-object pairs
         if n_h == 0 or n <= 1:
             print(n_h, n)
-            # boxes_h_collated.append(torch.zeros(0, device=device, dtype=torch.int64))
-            # boxes_o_collated.append(torch.zeros(0, device=device, dtype=torch.int64))
-            # object_class_collated.append(torch.zeros(0, device=device, dtype=torch.int64))
-            # prior_collated.append(torch.zeros(2, 0, self.num_classes, device=device))
-            # continue
-
         # Get the pairwise indices
         x, y = torch.meshgrid(
             torch.arange(n, device=device),
@@ -340,22 +295,7 @@ class DataFactory(Dataset):
         union_boxes[:,1].clamp_(0, image_h)
         union_boxes[:,2].clamp_(0, image_w)
         union_boxes[:,3].clamp_(0, image_h)
-    
-        # region_props.append(dict(
-        #     boxes=bx[keep],
-        #     scores=sc[keep],
-        #     labels=lb[keep],
-        #     hidden_states=hs[keep],
-        #     mask = ms[keep]
-        # ))
-
-        # return sub_boxes.int(), obj_boxes.int(), union_boxes.int()
         return sub_boxes, obj_boxes, union_boxes
-
-    def get_union_mask(self, bbox, image_size):
-        n = len(bbox)
-        masks = torch.zeros
-        pass
 
 class CacheTemplate(defaultdict):
     """A template for VCOCO cached results """
@@ -374,25 +314,20 @@ class CacheTemplate(defaultdict):
 
 from torch.cuda import amp
 class CustomisedDLE(DistributedLearningEngine):
-    def __init__(self, net, dataloader, max_norm=0, num_classes=117, start_epoch = 0, **kwargs):
+    def __init__(self, net, dataloader, max_norm=0, num_classes=117, start_epoch = 0, writer=None, **kwargs):
         super().__init__(net, None, dataloader, **kwargs)
         self.max_norm = max_norm
         self.num_classes = num_classes
         self._start_epoch = start_epoch
-        # self.scaler = amp.GradScaler(enabled=True)
+        # ⭐ TensorBoard
+        self.writer = writer
+        self.global_step = start_epoch * len(dataloader)
 
     def _on_each_iteration(self):
         # with amp.autocast(enabled=True):
-        loss_dict = self._state.net(
-            *self._state.inputs, targets=self._state.targets)
-
+        loss_dict = self._state.net(*self._state.inputs, targets=self._state.targets)
         if torch.isnan(torch.tensor(list(loss_dict.values()))).any():
             raise ValueError(f"The HOI loss is NaN for rank {self._rank}")
-
-        # print("epoch", epoch, self._start_epoch, loss_dict)
-        # if epoch + self._start_epoch >=5:
-        # self._state.loss = sum(loss for loss in loss_dict.values() if loss_dict.keys() != "diffusion_loss")
-        # else:
         self._state.loss = sum(loss for loss in loss_dict.values())
         # print("final loss ", self._state.loss, epoch, self._start_epoch)
         self._state.optimizer.zero_grad(set_to_none=True)
@@ -400,8 +335,35 @@ class CustomisedDLE(DistributedLearningEngine):
         if self.max_norm > 0:
             torch.nn.utils.clip_grad_norm_(self._state.net.parameters(), self.max_norm)
         self._state.optimizer.step()
+        # ===============================
+        # ⭐ TensorBoard logging（核心）
+        # ===============================
+        if self.writer is not None and self._rank == 0:
+            for k, v in loss_dict.items():
+                if torch.is_tensor(v):
+                    self.writer.add_scalar(
+                        f'Loss/{k}',
+                        v.item(),
+                        self.global_step
+                    )
 
-    
+            self.writer.add_scalar(
+                'Loss/total',
+                self._state.loss.item(),
+                self.global_step
+            )
+
+            lr = self._state.optimizer.param_groups[0]['lr']
+            self.writer.add_scalar('LR', lr, self.global_step)
+        # ===============================
+        # 控制台打印训练进度
+        # ===============================
+        if self._rank == 0 and self.global_step % 50 == 0:  # 每50步打印一次
+            print(f"[Step {self.global_step}] Loss total: {self._state.loss.item():.4f}, "
+                  + ", ".join([f"{k}: {v.item():.4f}" for k, v in loss_dict.items()])
+                  + f", LR: {lr:.6f}")
+
+        self.global_step += 1
 
     @torch.no_grad()
     def test_hico(self, dataloader, args=None):
@@ -422,27 +384,13 @@ class CustomisedDLE(DistributedLearningEngine):
             num_gt=num_gt,
             algorithm='11P'
         )
-        dict_hois = {}
         count = 0
-
-       
-        dict_hoi_score = {}
-        tsne_feat_list = []
-        tsne_label_list = []
-        text_feat_list = []
-        text_label_list = []
-        name_list = {}
-        pred_list = {}
         seen_conf = {}
         unseen_conf = {}
 
-      
         for batch in tqdm(dataloader):
             inputs = pocket.ops.relocate_to_cuda(batch[0])
             outputs = net(inputs,batch[1])
-
-            # if "train2015" in batch[-1][0]['filename']:
-            #     continue
             # Skip images without detections
             if outputs is None or len(outputs) == 0:
                 continue
@@ -514,21 +462,17 @@ class CustomisedDLE(DistributedLearningEngine):
                     idx = 0
                     for temp_score, temp_ind in zip(int_score, int_ind):
                         idx += 1
-                        # print("hois", hoi)
                         if idx > 6:
                             continue
 
                         color = self.random_color()
 
                         # human
-                        # h_id = hoi['subject_id']
-                        
                         x1, y1, x2, y2 = boxes_h[temp_ind]
                         x1 *= w_ratio
                         x2 *= w_ratio
                         y1 *= h_ratio
                         y2 *= h_ratio
-                        # h_cls = pred_bboxes[h_id]['category_id']
                         h_name = "person"+str(idx)
                         cv2.rectangle(img_result, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
                         cv2.putText(img_result, '%s' % (h_name), (int(x1), int(y2)), cv2.FONT_HERSHEY_COMPLEX, 0.8, color, 2)
@@ -539,16 +483,11 @@ class CustomisedDLE(DistributedLearningEngine):
                         x2 *= w_ratio
                         y1 *= h_ratio
                         y2 *= h_ratio
-                        # ao_cls = hoi['category_id']
                         ao_name = HICO_INTERACTIONS[int(interactions[temp_ind])]['object']+str(idx)
                         cv2.rectangle(img_result, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
-                        # cv2.putText(img_result, '%s:%.4f' % (o_name, o_cls), (x1, y2), cv2.FONT_HERSHEY_COMPLEX, 1, color, 2)
                         cv2.putText(img_result, '%s' % (ao_name), (int(x1), int(y2)), cv2.FONT_HERSHEY_COMPLEX, 0.8, color, 2)
                         # action
-                        # i_cls = hoi['category_id']
                         i_name = HICO_INTERACTIONS[int(interactions[temp_ind])]['action'] + str(idx)
-                        # cv2.putText(img_result, '%s:%.4f' % (i_name, i_cls),
-                        #             (10, 50 * idx_box + 50), cv2.FONT_HERSHEY_COMPLEX, 1, color, 2)
                         if temp_ind in gt_ind:
                             i_name = i_name + " GT"
                         if int(interactions[temp_ind]) in hico_unseen_index[args.zs_type]:
@@ -557,10 +496,8 @@ class CustomisedDLE(DistributedLearningEngine):
                                 (10, int(50 * idx + 50)), cv2.FONT_HERSHEY_COMPLEX, 0.8, color, 2)                    
 
                     cv2.imwrite( save_path, img_result)
-
                 meter.append(scores, interactions, labels)   # scores human*object*verb, interaction（600), labels
-                
-
+            
         return meter.eval()
 
     def random_color(self):
@@ -655,10 +592,8 @@ class CustomisedDLE(DistributedLearningEngine):
     def cache_vcoco(self, dataloader, cache_dir='vcoco_cache', args = None):
         net = self._state.net
         net.eval()
-
         dataset = dataloader.dataset.dataset
         all_results = []
-        hoi_dict = {}
         for i, batch in enumerate(tqdm(dataloader)):
             inputs = pocket.ops.relocate_to_cuda(batch[0])
             output = net(inputs, batch[1])
@@ -686,17 +621,6 @@ class CustomisedDLE(DistributedLearningEngine):
             boxes_h *= scale_fct
             boxes_o *= scale_fct
 
-
-            # pdb.set_trace()
-            # for tgti in batch[1]:
-            #     actions = tgti['actions']
-            #     objects = tgti['object']
-            #     for ai, oi in zip(actions, objects):
-            #         HOIs = MAP_AO_TO_HOI_COCO[(ai.item(), oi.item())] 
-            #         if HOIs not in hoi_dict.keys():
-            #             hoi_dict[HOIs] = 0
-            #         hoi_dict[HOIs] += 1
-
             if args.vis_img == True:
                 save_path = os.path.join(args.vis_img_path)
                 if os.path.exists(save_path):
@@ -707,10 +631,6 @@ class CustomisedDLE(DistributedLearningEngine):
                 save_path = os.path.join(save_path, batch[1][0]['filename'])
 
                 img_result = cv2.imread(os.path.join("../data/mscoco2014/val2014", batch[1][0]['filename'])).astype(np.float32)
-                
-                # h, w, c = img_result.shape
-                # h_ratio = h/batch[1][0]['size'][0]
-                # w_ratio = w/batch[1][0]['size'][1]
 
             idx = -1
             cnt = -1
@@ -721,31 +641,18 @@ class CustomisedDLE(DistributedLearningEngine):
                 result[a_name[0] + '_agent'] = scr.item()
                 result['_'.join(a_name)] = bo.tolist() + [scr.item()]
                 all_results.append(result)
-                # pdb.set_trace()
 
-            # if batch[1][0]['filename'] == 'COCO_val2014_000000001700.jpg':
-            #     pdb.set_trace()
                 if args.vis_img == True and scr >= scores.topk(4).values[-1] :  
                     cnt += 1
                     color = self.random_color()
 
                     x1, y1, x2, y2 = bh
-                    # x1 *= w_ratio
-                    # x2 *= w_ratio
-                    # y1 *= h_ratio
-                    # y2 *= h_ratio
-                    # h_cls = pred_bboxes[h_id]['category_id']
                     h_name = "person"
                     cv2.rectangle(img_result, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
                     cv2.putText(img_result, '%s' % (h_name), (int(x1), int(y2)), cv2.FONT_HERSHEY_COMPLEX, 0.8, color, 2)
                     
                     # object& action
                     x1, y1, x2, y2 = bo
-                    # x1 *= w_ratio
-                    # x2 *= w_ratio
-                    # y1 *= h_ratio
-                    # y2 *= h_ratio
-                    # pdb.set_trace()
                     o_name = obj_to_name[output['objects'][idx]]
                     cv2.rectangle(img_result, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
                     cv2.putText(img_result, '%s' % (o_name), (int(x1), int(y2)), cv2.FONT_HERSHEY_COMPLEX, 0.8, color, 2)
@@ -755,59 +662,6 @@ class CustomisedDLE(DistributedLearningEngine):
                             (10, int(50 * cnt + 50)), cv2.FONT_HERSHEY_COMPLEX, 0.8, color, 2)                    
 
                     cv2.imwrite( save_path, img_result)
-            
-            # if args.vis_img == True:
-            #     gt_scale_fct = torch.as_tensor([
-            #     ow, oh , ow , oh ])
-            #     idxgt = -1
-            #     for gtbh, gtbo , gtact, gtobj in zip(batch[1][0]['boxes_h'], batch[1][0]['boxes_o'], batch[1][0]['actions'], batch[1][0]['object']):
-            #         idxgt += 1
-            #         color = self.random_color()
-            #         gtbh *= gt_scale_fct
-            #         x1 = gtbh[0]- gtbh[2]/2
-            #         x2 = gtbh[0]+ gtbh[2]/2
-            #         y1 = gtbh[1]- gtbh[3]/2
-            #         y2 = gtbh[1]+ gtbh[3]/2
-            #         # x1, y1, x2, y2 = gtbh*gt_scale_fct
-            #         # x1 *= w_ratio
-            #         # x2 *= w_ratio
-            #         # y1 *= h_ratio
-            #         # y2 *= h_ratio
-            #         # h_cls = pred_bboxes[h_id]['category_id']
-            #         h_name = "person"
-            #         cv2.rectangle(img_result, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
-            #         cv2.putText(img_result, '%s' % (h_name), (int(x1), int(y2)), cv2.FONT_HERSHEY_COMPLEX, 0.8, color, 2)
-                    
-            #         # object& action
-            #         gtbo *= gt_scale_fct
-            #         x1 = gtbo[0]- gtbo[2]/2
-            #         x2 = gtbo[0]+ gtbo[2]/2
-            #         y1 = gtbo[1]- gtbo[3]/2
-            #         y2 = gtbo[1]+ gtbo[3]/2
-            #         # x1 *= w_ratio
-            #         # x2 *= w_ratio
-            #         # y1 *= h_ratio
-            #         # y2 *= h_ratio
-            #         # pdb.set_trace()
-            #         o_name = obj_to_name[(gtobj.item())-1]
-            #         cv2.rectangle(img_result, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
-            #         cv2.putText(img_result, '%s' % (o_name), (int(x1), int(y2)), cv2.FONT_HERSHEY_COMPLEX, 0.8, color, 2)
-            #         # action
-            #         a_name_gt = dataset.actions[gtact].split()
-            #         cv2.putText(img_result, '%s' % (a_name_gt[0]),
-            #                 (10, int(50 * idxgt + 50)), cv2.FONT_HERSHEY_COMPLEX, 0.8, color, 2)                    
-
-            #         # pdb.set_trace()
-            #         cv2.imwrite( ( save_path.split(".")[0]+ "_gt.jpg"), img_result)
-            #         # if 'sit' in a_name_gt and 'dining' in o_name:
-            #         #     pdb.set_trace()
-            #         #     print(a_name_gt,  batch[1][0]['filename'])
-
-
-        # print("hoi_dict", hoi_dict)
-        # for i in range(236):
-        #     if i not in hoi_dict:
-        #         print("not HOI: ", i)
 
         if not os.path.exists(cache_dir):
             os.makedirs(cache_dir) 

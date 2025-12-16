@@ -1,3 +1,6 @@
+#定义了项目中用到的各种 Transformer 层
+#（Attention, Cross-Attention），用于特征融合模块。
+
 import copy
 import pdb
 from typing import Optional, List
@@ -64,7 +67,6 @@ class TransformerEncoderLayer(nn.Module):
         if self.normalize_before:
             return self.forward_pre(src, src_mask, src_key_padding_mask, pos)
         return self.forward_post(src, src_mask, src_key_padding_mask, pos)
-
 
 class TransformerSALayer(nn.Module):
 
@@ -149,7 +151,6 @@ class TransformerSALayer(nn.Module):
                                     tgt_key_padding_mask, memory_key_padding_mask, pos, query_pos)
         return self.forward_post(tgt, memory, tgt_mask, memory_mask,
                                  tgt_key_padding_mask, memory_key_padding_mask, pos, query_pos)
-
 
 class TransformerDecoderLayer(nn.Module):
 
@@ -283,8 +284,6 @@ class TransformerDecoder(nn.Module):
 
         return output.unsqueeze(0)
 
-
-
 class TransformerDecoderLayer_womhsa(nn.Module):
 
     def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.1,
@@ -372,7 +371,6 @@ class TransformerDecoderLayer_womhsa(nn.Module):
 def _get_clones(module, N):
     return nn.ModuleList([copy.deepcopy(module) for i in range(N)])
 
-
 def _get_activation_fn(activation):
     """Return an activation function given a string"""
     if activation == "relu":
@@ -382,4 +380,3 @@ def _get_activation_fn(activation):
     if activation == "glu":
         return F.glu
     raise RuntimeError(F"activation should be relu/gelu, not {activation}.")
-

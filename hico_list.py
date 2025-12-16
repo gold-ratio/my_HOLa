@@ -738,7 +738,6 @@ hico_verbs_sentence = ['a photo of a person is adjusting the object',
  'a photo of a person is wielding the object',
  'a photo of a person is zipping the object']
 
-
 hico_verbs_sentence_2=['action of the union region is adjusting',
  'action of the union region is assembling',
  'action of the union region is blocking',

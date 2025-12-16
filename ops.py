@@ -154,7 +154,6 @@ class BoxPairCoder:
         return regressed_h, regressed_o
 
 class HungarianMatcher(nn.Module):
-
     def __init__(self,
         cost_object: float = 1., cost_verb: float = 1.,
         cost_bbox: float = 1., cost_giou: float = 1.
@@ -309,7 +308,6 @@ class SetCriterion(nn.Module):
                 (prior + 1e-8) / (1 + torch.exp(-logits) - prior)
             ), labels, reduction='sum', alpha=self.args.alpha, gamma=self.args.gamma
         )
-
         return loss / n_p
 
     def regression_loss(self,
@@ -489,8 +487,6 @@ def binary_focal_loss_with_logits(
     else:
         raise ValueError("Unsupported reduction method {}".format(reduction))
 
-
-
 def normalize_boxes(boxes, image_size, patch_size):
     """
     Normalize bounding box coordinates to match the ViT Patch Grid scale.
@@ -532,25 +528,6 @@ def compute_box_distance(boxes_sub, boxes_obj, patch_size, image_size, sigma=1.5
 
     box_distances = []
     for i, (box_s, box_o) in enumerate(zip(boxes_sub, boxes_obj)):
-        # ## for subject
-        # # Compute box centers
-        # box_centers_s = (box_s[:, :2] + box_s[:, 2:]) / 2  # (num_objects_i, 2)
-        # box_sizes_s = box_s[:, 2:] - box_s[:, :2]  # (num_objects_i, 2)
-        # # Compute the normalized distance between patch centers and box centers
-        # distances_s = torch.abs(patch_grid[i].unsqueeze(0) - box_centers_s.unsqueeze(1)) / (box_sizes_s.unsqueeze(1) + 1e-6)
-        # distances_s = distances_s.mean(dim=-1)  # Average over x and y distances
-        # distances_s_weights = 0.5 ## distances_s.mean(dim=-1, keepdim=True)  
-
-        # ## for object
-        # box_centers_o = (box_o[:, :2] + box_o[:, 2:]) / 2  # (num_objects_i, 2)
-        # box_sizes_o = box_o[:, 2:] - box_o[:, :2]  # (num_objects_i, 2)
-        # distances_o = torch.abs(patch_grid[i].unsqueeze(0) - box_centers_o.unsqueeze(1)) / (box_sizes_o.unsqueeze(1) + 1e-6)
-        # distances_o = distances_o.mean(dim=-1)  # Average over x and y distances
-        # distances_o_weights = 0.5 ## distances_o.mean(dim=-1, keepdim=True)
-      
-        # box_distances.append((distances_s*distances_s_weights + distances_o*distances_o_weights) / (distances_s_weights+distances_o_weights))  # Average over subject and object distances
-    
-
         # 初始化 mask (batch-wise)
         device = box_s.device
         scale_factor = patch_size / image_size  # 将 bounding box 映射到 14x14 grid
@@ -558,7 +535,6 @@ def compute_box_distance(boxes_sub, boxes_obj, patch_size, image_size, sigma=1.5
         # 将 bounding box 转换到 patch grid
         box_s = (box_s * scale_factor).long().to(device)
         box_o = (box_o * scale_factor).long().to(device)
-
 
         mask = torch.zeros((len(box_s), patch_size, patch_size), dtype=torch.float32, device=box_s.device)
 
@@ -591,18 +567,6 @@ def compute_box_distance(boxes_sub, boxes_obj, patch_size, image_size, sigma=1.5
         reversed_mask = 1 - union_mask
         mask[reversed_mask>0] = -1E9
 
-        # mask = torch.maximum(human_mask, object_mask)  # Human/Object 设为 1
-        # union_region = union_mask - mask  # 计算 union 但不在 individual box 内的部分
-        # union_region[union_region < 0] = 0  # 确保没有负数
-        # reversed_mask = 1 - mask - union_region  # 反转 mask
-        # reversed_mask[reversed_mask < 0] = 0 
-
-        # mask *= 1  ### set hum, obj as 1 weights
-        # mask += union_region * 1  # set union weight as 1.5
-        # mask += reversed_mask * (1/1.5)  # set background weight as 1/1.5
-
-
-
         # **使用 2D 卷积进行高斯平滑**
         kernel_size = 3  # 控制平滑范围
         sigma = sigma
@@ -619,7 +583,6 @@ def compute_box_distance(boxes_sub, boxes_obj, patch_size, image_size, sigma=1.5
         pad_size = kernel_size // 2
         mask = F.conv2d(F.pad(mask, (pad_size, pad_size, pad_size, pad_size), mode='replicate'), gaussian_kernel, groups=1).squeeze(1)
         box_distances.append(mask.view(-1, patch_size * patch_size))
-
 
     return box_distances
     
@@ -675,7 +638,3 @@ def generate_patch_grid(image_size, patch_size, batch_size):
         object_mask[i, :prompt.size(0)] = 1  # Mark valid objects
     
     return padded_prompts, object_mask
-
-
-
-

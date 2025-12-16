@@ -1797,3 +1797,4 @@ Description: This general scene features a person and a kite coexisting in the s
 
 - Class: A photo of a person and a zebra.
   Description: The photo includes both a person and a zebra, with the nature of their interaction varying, showcasing their coexistence in the frame.
+  

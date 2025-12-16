@@ -1,6 +1,4 @@
-LICENSE
 MANIFEST.in
-README.md
 setup.py
 clip/__init__.py
 clip/bpe_simple_vocab_16e6.txt.gz

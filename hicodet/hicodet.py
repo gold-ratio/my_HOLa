@@ -6,7 +6,7 @@ Fred Zhang <frederic.zhang@anu.edu.au>
 The Australian National University
 Australian Centre for Robotic Vision
 """
-
+#HICO-DET 数据集的 Dataset 类，负责读取图片和标注。
 import os
 import json
 import numpy as np

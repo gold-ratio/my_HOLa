@@ -16,6 +16,5 @@ wget --load-cookies /tmp/cookies.txt "https://docs.google.com/uc?export=download
 echo "Extracting..."
 
 tar zxf $FILE
-rm $FILE
 
 echo "Done."

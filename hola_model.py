@@ -1,76 +1,69 @@
-"""
-Unary-pairwise transformer for human-object interaction detection
-
-Fred Zhang <frederic.zhang@anu.edu.au>
-
-The Australian National University
-Australian Centre for Robotic Vision
-"""
-
-import argparse
-import numpy as np
-import os.path as osp
-import pandas as pd
-import torch.nn.functional as F
-import torchvision
-import torchvision.utils as vutils
-import tqdm as tqdmtqdm
-import torchvision.transforms as torch_transforms
-from torchvision.transforms.functional import InterpolationMode
-from builtins import Exception
+#【模型骨架】 定义了 HOLa 整个模型的架构。
+# 它会将视觉分支（Vision Branch）和语言分支（Language Branch）拼装在一起。
 import os
-import torch
-import torch.distributed as dist
-from torchvision import transforms
-
-from torch import nn, Tensor
-from typing import Optional, List
-from torchvision.ops.boxes import batched_nms, box_iou
-import torch.nn.functional as F
-from torch.nn.utils.rnn import pad_sequence
-
-from ops import binary_focal_loss_with_logits, compute_spatial_encodings
-
 import sys
-from hico_list import hico_verb_object_list,hico_verbs,hico_verbs_sentence,hico_verbs_sentence_2
-from vcoco_list import vcoco_verbs_sentence
+import math
+import json
+import copy
+import pickle
+import random
+from collections import OrderedDict
+from typing import Optional, List
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.decomposition import PCA
+from sklearn.manifold import TSNE
+import torch
+import torch.nn.functional as F
+import torch.distributed as dist
+from torch import nn, Tensor
+import torchvision
+from torchvision.ops.boxes import batched_nms, box_iou
+# DETR
 sys.path.append('detr')
 from detr.models import build_model
 from util import box_ops
 from util.misc import nested_tensor_from_tensor_list
-import pdb
+# Custom ops
+from ops import (
+    binary_focal_loss_with_logits,
+    compute_spatial_encodings,
+)
+# CLIP
+import clip
 import CLIP_models_adapter_prior2
-import torchvision
-from collections import OrderedDict
-import numpy as np
-import torch.nn.functional as F
-from transformer_module import TransformerDecoderLayer, TransformerSALayer
 from CLIP.clip.simple_tokenizer import SimpleTokenizer as _Tokenizer
-import clip 
-from ops import box_xyxy_to_cxcywh, box_cxcywh_to_xyxy, normalize_boxes, compute_box_distance, generate_patch_grid, compute_attention_mask
-import pickle, random
-from tqdm import tqdm
-from hico_text_label import hico_unseen_index, MAP_AO_TO_HOI, HICO_INTERACTIONS, obj_to_name, HOI_TO_AO, HOI_IDX_TO_ACT_IDX, HOI_IDX_TO_OBJ_IDX, ACT_IDX_TO_ACT_NAME, RARE_HOI_IDX
+# Transformer modules
+from transformer_module import (
+    TransformerDecoderLayer,
+    TransformerSALayer,
+)
+# HICO
+from hico_list import (
+    hico_verb_object_list,
+    hico_verbs,
+    hico_verbs_sentence,
+    hico_verbs_sentence_2,
+)
 import hico_text_label
-from vcoco_text_label import vcoco_hoi_text_label, MAP_AO_TO_HOI_COCO, HOI_TO_AO_COCO
-import cv2
-import cv2
-from PIL import Image
-import matplotlib.pyplot as plt
-import math
-from random import sample
-import json
-import copy
-from sklearn.decomposition import PCA
-from sklearn.manifold import TSNE
-from torch.nn.utils.rnn import pad_sequence
-
-
+from hico_text_label import (
+    hico_unseen_index,
+    MAP_AO_TO_HOI,
+    HICO_INTERACTIONS,
+    obj_to_name,
+    HOI_TO_AO,
+    HOI_IDX_TO_ACT_IDX,
+    HOI_IDX_TO_OBJ_IDX,
+    ACT_IDX_TO_ACT_NAME,
+    RARE_HOI_IDX,
+)
+import pdb
 
 # feat_dim = 512
 def _get_clones(module, N):
     return nn.ModuleList([copy.deepcopy(module) for i in range(N)])
 
+#主要用于学习输入特征之间的关系或相似性，通常用于少样本学习（Few-Shot Learning）或度量学习（Metric Learning）任务中
 class RelationNet(nn.Module):
     def __init__(self, feature_size=1536, embed_size=128):
         super(RelationNet, self).__init__()
@@ -92,36 +85,36 @@ class RelationNet(nn.Module):
     def forward(self, feat1, feat2):
         feat1 = self.fc1(feat1)
         feat2 = self.fc1(feat2)
+        #创建了一个张量，其中包含了 feat1 中的每一个特征与 feat2 中的每一个特征的连接（torch.cat）。
         feat1_ex = feat1.unsqueeze(1).repeat(1, feat2.shape[0], 1)
         feat2_ex = feat2.unsqueeze(0).repeat(feat1.shape[0], 1, 1)
         relation_pairs = torch.cat((feat1_ex, feat2_ex), 2)
         relation = self.g_mlp(relation_pairs)
         relation = self.fc3(relation)
         relation = self.sigm(relation)
-        # relation = relation.sum(1)
         return relation.squeeze(2)
 
 _tokenizer = _Tokenizer()
+#简单的多层感知机（MLP）实现
 class MLP(nn.Module):
     """ Very simple multi-layer perceptron (also called FFN)"""
-
     def __init__(self, input_dim, hidden_dim, output_dim, num_layers):
         super().__init__()
         self.num_layers = num_layers
         h = [hidden_dim] * (num_layers - 1)
+        #使用 nn.ModuleList 来存储每一层的线性变换
         self.layers = nn.ModuleList(nn.Linear(n, k) for n, k in zip([input_dim] + h, h + [output_dim]))
 
     def forward(self, x):
         for i, layer in enumerate(self.layers):
-            # print("!!!", x.device, layer.weight.device)
             try:
                 x = F.relu(layer(x)) if i < self.num_layers - 1 else layer(x)
             except:
                 x = x.to(layer.weight.device)
                 x = F.relu(layer(x)) if i < self.num_layers - 1 else layer(x)
-                # print("!!!", x.device, layer.weight.device, layer.bias.device)
         return x
 
+# 用于预测权重的神经网络模块
 class Weight_Pred(nn.Module):
     def __init__(self, input_dim, output_dim) -> None:
         super().__init__()
@@ -134,19 +127,20 @@ class Weight_Pred(nn.Module):
         x = self.linear2(x)
         return F.sigmoid(x)
 
+# 对输入张量进行归一化处理的层
 class LayerNorm(nn.LayerNorm):
     """Subclass torch's LayerNorm to handle fp16."""
-
     def forward(self, x: torch.Tensor):
         orig_type = x.dtype
         ret = super().forward(x.type(torch.float32))
         return ret.type(orig_type)
 
-
+# GELU 激活函数的快速近似实现
 class QuickGELU(nn.Module):
     def forward(self, x: torch.Tensor):
         return x * torch.sigmoid(1.702 * x)
 
+# 残差注意力块，结合了多头自注意力机制和前馈神经网络
 class ResidualAttentionBlock(nn.Module):
     def __init__(self, d_model: int, n_head: int, attn_mask: torch.Tensor = None):
         super().__init__()
@@ -160,23 +154,17 @@ class ResidualAttentionBlock(nn.Module):
         self.ln_2 = LayerNorm(d_model)
         self.attn_mask = attn_mask
 
-
     def attention(self, x: torch.Tensor):
         self.attn_mask = self.attn_mask.to(dtype=x.dtype, device=x.device) if self.attn_mask is not None else None
-        # return self.attn(x, x, x, need_weights=False, attn_mask=self.attn_mask)[0]
         return self.attn(x, x, x, need_weights=True, attn_mask=self.attn_mask)
 
     def forward(self, x: torch.Tensor):
-        '''
-        x: L * bs * C, 
-        prior[0]: bs * L' * C', padded prior knowledge
-        prior[1]: bs * L' (mask of prior knowledge)
-        ''' 
         tempa = self.attention(self.ln_1(x))
         x = x + tempa[0]  
         x = x + self.mlp(self.ln_2(x))    
         return x
 
+# Transformer 模块，包含多个残差注意力块
 class Transformer(nn.Module):
     def __init__(self, width: int, layers: int, heads: int, attn_mask: torch.Tensor = None, adapter: bool=False, adapter_layers: List=[i for i in range(24)], adapter_num_layers: int=1):
         super().__init__()
@@ -186,27 +174,17 @@ class Transformer(nn.Module):
 
     def forward(self, x: torch.Tensor):
         return self.resblocks(x)[0]
-        # return self.resblocks((x,prior))
+        #这里的0是什么？
 
-
-
+#实现了一种可插拔、可学习的模块，其设计目的是在保持主干网络（Backbone Network）大部分参数冻结的情况下，高效地对模型进行微调
 class Adapter(nn.Module):
-    def __init__(self,
-                input_size,
-                 dropout=0.1,
-                 adapter_scalar="1.0",
-                 adapter_num_layers=1,
-                 mem_adpt_self = False, 
-                 SA_only = False,
-                 prior_dim = None,
-                 prior_dim_2 = None,
-                 down_size = 64,
-                 ):
+    def __init__(self, input_size, dropout=0.1, adapter_scalar="1.0", adapter_num_layers=1, mem_adpt_self = False, 
+                SA_only = False, prior_dim = None, prior_dim_2 = None, down_size = 64):
         super().__init__()
         self.n_embd = input_size
         self.down_size = down_size
         self.scale = float(adapter_scalar)
-
+        #在低维空间进行计算，从而大大减少了新增的参数量
         self.down_proj_mem = nn.Linear(self.n_embd, self.down_size)
         self.non_linear_func = nn.ReLU()
         self.up_proj_mem = nn.Linear(self.down_size, self.n_embd)
@@ -219,10 +197,6 @@ class Adapter(nn.Module):
             self.down_proj_prior = nn.Linear(prior_dim, down_size)
         if prior_dim_2 is not None:
             self.down_proj_prior_2 = MLP(prior_dim_2, 128, 64, 3)
-        # if txt_prior == False:
-        #     self.down_proj_prior = MLP(feat_dim, 128, 64, 3)
-        # else:
-        #     self.down_proj_prior = MLP(input_size, 128, 64, 3)
 
         self.dropout = dropout
         with torch.no_grad():
@@ -287,6 +261,8 @@ class Adapter(nn.Module):
             output = (up * self.scale) + x
         return output
 
+#文本编码器,CLIP (Contrastive Language–Image Pre-training) 模型中的关键组件
+#将输入的文本转换成一个高质量的、可用于与图像特征进行对比学习的固定长度向量（特征嵌入）
 class TextEncoder(nn.Module):
     def __init__(self, clip_model):
         super().__init__()
@@ -302,13 +278,13 @@ class TextEncoder(nn.Module):
         x = self.transformer(x)
         x = x.permute(1, 0, 2)  # LND -> NLD
         x = self.ln_final(x).type(self.dtype)
-
-        # x.shape = [batch_size, n_ctx, transformer.width]
-        # take features from the eot embedding (eot_token is the highest number in each sequence)
+        # 取出每个序列中最后一个非填充标记的特征向量，并通过线性变换映射到最终的文本特征空间
         x = x[torch.arange(x.shape[0]), tokenized_prompts.argmax(dim=-1)] @ self.text_projection
-
         return x
 
+#实现了 Context Optimization (CoOp) 这种高效微调方法的核心思想, 将提示中的某些词替换为可学习的向量
+#这个类的作用是：为每个类别生成可优化的、基于 CLIP 模型的软提示 (Soft Prompts) 嵌入
+#将 CLIP 从一个需要人工提示工程的固定模型，转变为一个可以在新任务上高效、自动化地学习出最佳“提示”的可微调模型
 class PromptLearner(nn.Module):
     def __init__(self, args, classnames, clip_model):
         super().__init__()
@@ -317,12 +293,8 @@ class PromptLearner(nn.Module):
         ctx_init = args.CTX_INIT ## cfg.TRAINER.COOP.CTX_INIT
         dtype = clip_model.dtype
         ctx_dim = clip_model.ln_final.weight.shape[0]
-        # clip_imsize = clip_model.visual.input_resolution
-        # cfg_imsize = cfg.INPUT.SIZE[0]
-        # assert cfg_imsize == clip_imsize, f"cfg_imsize ({cfg_imsize}) must equal to clip_imsize ({clip_imsize})"
 
-        if ctx_init:
-            # use given words to initialize context vectors
+        if ctx_init:#预定义的上下文初始化
             ctx_init = ctx_init.replace("_", " ")
             n_ctx = len(ctx_init.split(" "))
             prompt = clip.tokenize(ctx_init)
@@ -330,21 +302,21 @@ class PromptLearner(nn.Module):
                 embedding = clip_model.token_embedding(prompt).type(dtype)
             ctx_vectors = embedding[0, 1 : 1 + n_ctx, :]
             prompt_prefix = ctx_init
-        else:
-            # random initialization
+        else:#标准差为0.02的随机初始化上下文
             if args.CSC: # cfg.TRAINER.COOP.CSC:
                 print("Initializing class-specific contexts")
+                #为每个类别初始化独特的上下文向量
                 ctx_vectors = torch.empty(n_cls, n_ctx, ctx_dim, dtype=dtype)
             else:
                 print("Initializing a generic context")
+                #为所有类别初始化相同的上下文向量
                 ctx_vectors = torch.empty(n_ctx, ctx_dim, dtype=dtype)
             nn.init.normal_(ctx_vectors, std=0.02)
             prompt_prefix = " ".join(["X"] * n_ctx)
-
         print(f'Initial context: "{prompt_prefix}"')
         print(f"Number of context words (tokens): {n_ctx}")
 
-        self.ctx = nn.Parameter(ctx_vectors)  # to be optimized
+        self.ctx = nn.Parameter(ctx_vectors)#可学习的上下文向量
         
         # classnames = [name.replace("_", " ") for name in classnames]
         name_lens = [len(_tokenizer.encode(name)) for name in classnames]
@@ -370,18 +342,16 @@ class PromptLearner(nn.Module):
         ctx = self.ctx
         if ctx.dim() == 2:
             ctx = ctx.unsqueeze(0).expand(self.n_cls, -1, -1)
-
+        # 拼接前缀、上下文和后缀，形成完整的提示嵌入
         prefix = self.token_prefix
         suffix = self.token_suffix
 
         if self.class_token_position == "end":
-            prompts = torch.cat(
-                [
+            prompts = torch.cat([
                     prefix,  # (n_cls, 1, dim)
                     ctx,     # (n_cls, n_ctx, dim)
                     suffix,  # (n_cls, *, dim)
-                ],
-                dim=1,
+                ],dim=1,
             )
 
         elif self.class_token_position == "middle":
@@ -394,15 +364,13 @@ class PromptLearner(nn.Module):
                 suffix_i = suffix[i : i + 1, name_len:, :]
                 ctx_i_half1 = ctx[i : i + 1, :half_n_ctx, :]
                 ctx_i_half2 = ctx[i : i + 1, half_n_ctx:, :]
-                prompt = torch.cat(
-                    [
+                prompt = torch.cat([
                         prefix_i,     # (1, 1, dim)
                         ctx_i_half1,  # (1, n_ctx//2, dim)
                         class_i,      # (1, name_len, dim)
                         ctx_i_half2,  # (1, n_ctx//2, dim)
                         suffix_i,     # (1, *, dim)
-                    ],
-                    dim=1,
+                    ],dim=1,
                 )
                 prompts.append(prompt)
             prompts = torch.cat(prompts, dim=0)
@@ -415,30 +383,25 @@ class PromptLearner(nn.Module):
                 class_i = suffix[i : i + 1, :name_len, :]
                 suffix_i = suffix[i : i + 1, name_len:, :]
                 ctx_i = ctx[i : i + 1, :, :]
-                prompt = torch.cat(
-                    [
+                prompt = torch.cat([
                         prefix_i,  # (1, 1, dim)
                         class_i,   # (1, name_len, dim)
                         ctx_i,     # (1, n_ctx, dim)
                         suffix_i,  # (1, *, dim)
-                    ],
-                    dim=1,
+                    ],dim=1,
                 )
                 prompts.append(prompt)
             prompts = torch.cat(prompts, dim=0)
 
         else:
-            raise ValueError
-
+            raise ValueError(f"Unknown class_token_position: {self.class_token_position}")
         return prompts
 
+#一个基于 CLIP 模型的定制化分类框架，将图像编码器、文本编码器和基于 CoOp 的提示学习器集成在一起，用于执行图像分类任务
 class CustomCLIP(nn.Module):
     def __init__(self, args, classnames, clip_model):
         super().__init__()
-        # self.prompt_learner = PromptLearner(args, classnames, clip_model)
-        # self.tokenized_prompts = self.prompt_learner.tokenized_prompts
         self.image_encoder = clip_model.visual
-        # self.text_encoder = TextEncoder(clip_model)
         self.logit_scale = clip_model.logit_scale
         self.dtype = clip_model.dtype
 
@@ -447,6 +410,10 @@ class CustomCLIP(nn.Module):
         self.transformer = clip_model.transformer
         self.ln_final = clip_model.ln_final
         self.text_projection = clip_model.text_projection
+        #这三个没有 怎么运行的？？？
+        self.prompt_learner = PromptLearner(args, classnames, clip_model)
+        self.tokenized_prompts = self.prompt_learner.tokenized_prompts
+        self.text_encoder = TextEncoder(clip_model)
 
     def encode_text(self, text):
         x = self.token_embedding(text).type(self.dtype)  # [batch_size, n_ctx, d_model]
@@ -462,6 +429,7 @@ class CustomCLIP(nn.Module):
         return x
     
     def forward(self, image):
+        # 特征提取
         image_features = self.image_encoder(image.type(self.dtype))
 
         prompts = self.prompt_learner()
@@ -470,42 +438,27 @@ class CustomCLIP(nn.Module):
 
         image_features = image_features / image_features.norm(dim=-1, keepdim=True)
         text_features = text_features / text_features.norm(dim=-1, keepdim=True)
-
+        #计算所有图像特征I和所有类别特征T之间的余弦相似度矩阵（点积），并乘以可学习的缩放因子 logit_scale
         logit_scale = self.logit_scale.exp()
         logits = logit_scale * image_features @ text_features.t()
-        raise ValueError
         return logits
 
+# Focal Loss 实现，用于处理类别不平衡问题
 class FocalLoss(nn.Module):
     def __init__(self, gamma=2, alpha=0.25, reduction='mean'):
-        """
-        Focal Loss 实现
-        :param gamma: 控制容易样本的损失缩小程度（常用 γ=2）
-        :param alpha: 类别权重因子（适用于类别不平衡，常用 α=0.25）
-        :param reduction: 'mean' 或 'sum'
-        """
         super(FocalLoss, self).__init__()
         self.gamma = gamma
         self.alpha = alpha
         self.reduction = reduction
 
     def forward(self, logits, targets):
-        """
-        计算 Focal Loss
-        :param logits: 模型的 raw logits（未经过 sigmoid）
-        :param targets: 真实标签（0 或 1）
-        """
         # 计算 Sigmoid 后的概率
-        # probs = torch.sigmoid(logits)
         probs = logits.clamp(min=1e-6, max=1.0 - 1e-6)  # 避免数值稳定性问题
-
         # 计算 p_t
         pt = probs * targets + (1 - probs) * (1 - targets)
-
         # 计算 Focal Loss
         ce_loss = F.binary_cross_entropy(probs, targets, reduction='none')
         focal_loss = self.alpha * (1 - pt) ** self.gamma * ce_loss
-
         # Reduction
         if self.reduction == 'mean':
             return focal_loss.mean()
@@ -514,10 +467,10 @@ class FocalLoss(nn.Module):
         else:
             return focal_loss
 
+#???写这么长，我怎么看？？？
 class UPT(nn.Module):
     """
     Unary-pairwise transformer
-
     Parameters:
     -----------
     detector: nn.Module
@@ -543,22 +496,12 @@ class UPT(nn.Module):
     max_instances: float
         Maximum number of instances (human or object) to sample
     """
-    def __init__(self,
-        args,
-        detector: nn.Module,
-        postprocessor: nn.Module,
-        model: nn.Module,
-        origin_text_embeddings: torch.tensor,
-        object_embedding: torch.tensor,
-        human_idx: int, num_classes: int,
-        alpha: float = 0.5, gamma: float = 2.0,
-        box_score_thresh: float = 0.2, fg_iou_thresh: float = 0.5,
-        min_instances: int = 3, max_instances: int = 15,
-        object_class_to_target_class: List[list] = None,
-        object_n_verb_to_interaction: List[list] = None,
-        **kwargs,
-    ) -> None:
+    def __init__(self,args, detector: nn.Module, postprocessor: nn.Module, model: nn.Module, origin_text_embeddings: torch.tensor,
+        object_embedding: torch.tensor, human_idx: int, num_classes: int, alpha: float = 0.5, gamma: float = 2.0,
+        box_score_thresh: float = 0.2, fg_iou_thresh: float = 0.5, min_instances: int = 3, max_instances: int = 15,
+        object_class_to_target_class: List[list] = None, object_n_verb_to_interaction: List[list] = None, **kwargs) -> None:
         super().__init__()
+        self.vcoco = False
         self.detector = detector
         self.postprocessor = postprocessor
         self.clip_head = model
@@ -568,39 +511,33 @@ class UPT(nn.Module):
         self.visual_output_dim = model.image_encoder.output_dim
         self.visual_patchsize = model.image_encoder.patch_size
         self.visual_input_resolution = model.image_encoder.input_resolution
-        self.object_n_verb_to_interaction = np.asarray(
-                                object_n_verb_to_interaction, dtype=float
-                            )
-
+        
         self.human_idx = human_idx
         self.num_classes = num_classes
+        self.object_class_to_target_class = object_class_to_target_class
+        self.object_n_verb_to_interaction = np.asarray(object_n_verb_to_interaction, dtype=float)
 
         self.alpha = alpha
         self.gamma = gamma
-
         self.box_score_thresh = box_score_thresh
         self.fg_iou_thresh = fg_iou_thresh
 
         self.min_instances = min_instances
         self.max_instances = max_instances
-        self.object_class_to_target_class = object_class_to_target_class
         self.num_anno = kwargs["num_anno"]
-
-        self.num_classes = num_classes
         self.use_multi_hot = args.use_multi_hot
            
         feat_dim = args.feat_dim
         self.feature = []
         if 'HO' in args.logits_type:
             self.feature.append('hum_obj')
-
         self.feature = '_'.join(self.feature)
+        
         self.logits_type = args.logits_type
 
         num_shot = args.num_shot
         file1 = args.file1
         self.file1 = file1
-
 
         if args.zs:
             self.zs_type = args.zs_type
@@ -649,16 +586,6 @@ class UPT(nn.Module):
                 hoicls_w = pca.components_
                 self.hoicls_w = nn.Parameter(torch.tensor(hoicls_w).T)
                 self.basis_num = len(pca_hoicls_txt)
-                act_basis_num = self.basis_num // 2
-
-                
-            elif args.basis_feat_init == 'random':
-                pca_hoicls_txt = torch.randn(self.basis_num, len(temp_hoicls_txt)).to(kwargs['hoicls_txt'].dtype)
-                pca_hoicls_txt = pca_hoicls_txt / pca_hoicls_txt.norm(dim=-1, keepdim=True)
-                self.basis_feat = nn.Parameter(pca_hoicls_txt)
-                hoicls_w = kwargs['hoicls_txt'] @ torch.pinverse(pca_hoicls_txt)
-                self.hoicls_w = nn.Parameter(hoicls_w)
-                act_basis_num = self.basis_num // 2
 
             print("low rank: ", self.basis_num)
 
@@ -681,8 +608,6 @@ class UPT(nn.Module):
                 
                 if self.basis_feat_constraint != 'none':
                     actcls_txt = torch.randn(self.basis_num, len(temp_hoicls_txt)).to(kwargs['hoicls_txt'].dtype)
-                    # import pdb
-                    # pdb.set_trace()
                     actcls_txt = actcls_txt / actcls_txt.norm(dim=-1, keepdim=True)
                     self.act_related_index = torch.tensor(list(range(self.basis_num //self.sep_frac , self.basis_num)))
                     self.act_basis_feat = nn.Parameter(actcls_txt[self.act_related_index])
@@ -695,10 +620,8 @@ class UPT(nn.Module):
                 self.actcls_w = nn.Parameter(actcls_w)
                 self.act_related_index = nn.Parameter(self.act_related_index, requires_grad=False)
             
-
-            
         self.individual_norm = True
-        self.logits_type = args.logits_type #
+        self.logits_type = args.logits_type
         self.consist = True
         self.evaluate_type = 'detr' # gt, detr
         self.img_align = args.img_align
@@ -729,7 +652,6 @@ class UPT(nn.Module):
         self.use_weight_pred = args.use_weight_pred
         if self.finetune_adapter:
             if 'HO' in self.logits_type:
-
                 self.label_HO = nn.Parameter(self.one_hots_HO, requires_grad=False)
                 if not self.use_weight_pred:
                     self.logit_scale_HO = nn.Parameter(torch.ones([]) * np.log(1 / 0.07)) 
@@ -820,11 +742,6 @@ class UPT(nn.Module):
             num_branch = len(self.logits_type.split('+'))
             self.weight_pred = Weight_Pred(input_dim=self.visual_output_dim*3, output_dim=num_branch)
 
-        self.vcoco = True if args.dataset == 'vcoco' else False
-        if args.dataset == 'vcoco':
-            self.vcoco_rela = RelationNet()
-
-
         if 'U' in self.logits_type:
             self.vis_fuse = nn.Sequential(
                 nn.Linear(self.visual_output_dim * 2, self.visual_output_dim),
@@ -840,13 +757,11 @@ class UPT(nn.Module):
         self.disentangle_basis = args.disentangle_basis
         self.fix_act_w = args.fix_act_w
 
-  
         self.ho_pair_pt = args.ho_pair_pt
         self.pred_type = args.pred_type
         self.ho_pair_prior = args.ho_pair_prior
         self.pred_type = args.pred_type
         self.pt_init = args.pt_init
-        # self.pt_attn = args.pt_attn
         if args.ho_pair_pt is True:
             vis_dim = 768 if feat_dim == 512 else 1024
             self.HO_pair_prior_text_embeddings = kwargs['HO_pair_text_embeddings']
@@ -856,20 +771,15 @@ class UPT(nn.Module):
             elif self.ho_pair_prior == 2:
                 self.pt_adapter = Adapter(256, mem_adpt_self = True)
 
-            
             self.pt_spacial_proj = nn.Linear(256, vis_dim)
             self.pt_spacial_proj_norm = LayerNorm(vis_dim)
-
 
             if self.pt_init == 'pos+detr+fus':
                 self.pt_token_fus = Adapter(256, mem_adpt_self = False, SA_only=False, prior_dim=36)
             else:
                 self.pt_posenc_head = nn.Sequential(
                     nn.Linear(36, 128), nn.ReLU(),
-                    nn.Linear(128, 256), nn.ReLU(),
-                )            
-
-
+                    nn.Linear(128, 256), nn.ReLU())
 
     def positional_encoding(self, seq_len, d_model):
         """ 
@@ -882,36 +792,16 @@ class UPT(nn.Module):
         div_term = torch.pow(10000.0, 2*torch.arange(0, d_model//2)/d_model) 
         positional_embedding[0, :, 0::2] = torch.sin(pos / div_term)
         positional_embedding[0, :, 1::2] = torch.cos(pos / div_term)
-        
-        """ OR
-        div_term = torch.exp(torch.arange(0, d_model, 2).float() * -(math.log(10000.0) / d_model))
-
-        positional_embedding[0, :, 0::2] = torch.sin(pos * div_term)
-        positional_embedding[0, :, 1::2] = torch.cos(pos * div_term)
-        """
         return positional_embedding
 
     def load_cache_model(self,file1, feature='uni',num_classes=117, num_shot=10, filtered_hoi_idx=[], use_multi_hot=False, label_choice='random', 
-                         num_anno=None, hoicls_txt = None, args = None):  ## √
-        
-
-        if args is not None and args.dataset =='vcoco':
-            HOI_TO_AO_hoi = HOI_TO_AO_COCO
-            numcls = 236
-            cache_labels = np.array([HOI_TO_AO_COCO[i][0] for i in range(numcls)])
-        else:
-            HOI_TO_AO_hoi = HOI_TO_AO
-            numcls = 600
-            cache_labels = np.array(HOI_IDX_TO_ACT_IDX)
-
+                         num_anno=None, hoicls_txt = None, args = None):
+        cache_labels = np.array(HOI_IDX_TO_ACT_IDX)
         cache_models = hoicls_txt / hoicls_txt.norm(dim=-1, keepdim=True)
-
         labels = torch.tensor(cache_labels)
         labels = torch.nn.functional.one_hot(labels, num_classes=num_classes)
-        
         return cache_models, labels, torch.sum(labels, dim=0)
 
-    
     def _reset_parameters(self):  ## xxx
         for p in self.context_aware.parameters():
             if p.dim() > 1:
@@ -922,8 +812,7 @@ class UPT(nn.Module):
 
     def compute_prior_scores(self,
         x: Tensor, y: Tensor, scores: Tensor, object_class: Tensor
-    ) -> Tensor:  ### √
-
+    ) -> Tensor:
         prior_h = torch.zeros(len(x), self.num_classes, device=scores.device)
         prior_o = torch.zeros_like(prior_h)
         
@@ -948,30 +837,21 @@ class UPT(nn.Module):
         prior_o[pair_idx, flat_target_idx] = s_o[pair_idx]
 
         return torch.stack([prior_h, prior_o])
-    
 
     def compute_roi_embeddings(self, features: OrderedDict, image_size: Tensor, region_props: List[dict], targets = None, fix_mem = False, vcoco = False, images = None, paired_tokens=None):
         device = features.device
         boxes_h_collated = []; boxes_o_collated = []
         prior_collated = []; object_class_collated = []
-        # pairwise_tokens_collated = []
-        attn_maps_collated = []
         all_logits = []
 
         img_h, img_w = image_size.unbind(-1)
-        scale_fct = torch.stack([img_w, img_h, img_w, img_h], dim=1)
 
         gt_feats_collated = []
         pair_feats_collated = []
-        gt_all_logits = []
-        pair_logits = []
-        pair_prior = []
-        gt_labels = []
         glb_feat_list = []
         adapter_feat_list = []
         ho_adapter_feat_list = []
  
-
         for b_idx, props in enumerate(region_props):
             local_features = features[b_idx]
 
@@ -1003,9 +883,6 @@ class UPT(nn.Module):
             )
             # Valid human-object pairs
             x_keep, y_keep = torch.nonzero(torch.logical_and(x != y, x < n_h)).unbind(1)
-            if len(x_keep) == 0:
-                # Should never happen, just to be safe
-                raise ValueError("There are no valid human-object pairs")
             x = x.flatten(); y = y.flatten()
 
             # extract single roi features
@@ -1020,7 +897,6 @@ class UPT(nn.Module):
             union_features = torchvision.ops.roi_align(local_features.unsqueeze(0),[union_boxes],output_size=(7, 7),spatial_scale=spatial_scale,aligned=True)
             single_features = torchvision.ops.roi_align(local_features.unsqueeze(0),[boxes],output_size=(7, 7),spatial_scale=spatial_scale,aligned=True)
 
-
             if self.feat_mask_type == 0:
                 union_features = self.featmap_dropout(union_features).flatten(2).mean(-1)
                 single_features = self.featmap_dropout(single_features).flatten(2).mean(-1)
@@ -1031,7 +907,6 @@ class UPT(nn.Module):
             object_features = single_features[y_keep]
 
             if self.individual_norm: ## todo should use norm during finetuning?? 
-                concat_feat_original = torch.cat([human_features,object_features, union_features],dim=-1)
                 human_features = human_features / human_features.norm(dim=-1, keepdim=True)
                 object_features = object_features / object_features.norm(dim=-1, keepdim=True)
                 union_features = union_features / union_features.norm(dim=-1, keepdim=True)
@@ -1047,7 +922,6 @@ class UPT(nn.Module):
 
             if self.basis_feat_enable is True:
                 if self.HOI_train_w_b == 'w':
-                    # temp_basis = self.basis_feat.clone().detach()
                     txt_optimized = self.hoicls_w @ self.basis_feat.clone().detach()
                 elif self.HOI_train_w_b == 'b':
                     txt_optimized = self.hoicls_w.clone().detach() @ self.basis_feat
@@ -1057,20 +931,14 @@ class UPT(nn.Module):
                     txt_optimized = self.hoicls_w.clone().detach() @ self.basis_feat.clone().detach()
             else:
                 txt_optimized = self.cache_model_HO
+            
             if self.self_adapt == True and self.fix_mem is False:
-                txt_optimized = self.self_adapter(txt_optimized.unsqueeze(0), 
-                                                        txt_optimized.unsqueeze(0)).squeeze(0)
+                txt_optimized = self.self_adapter(txt_optimized.unsqueeze(0), txt_optimized.unsqueeze(0)).squeeze(0)
 
-            if vcoco is True:
-                adapter_feat = (self.mem_adapter(txt_optimized.unsqueeze(1), 
-                                local_features.flatten(1).mean(-1).unsqueeze(0).unsqueeze(1).repeat(len(self.hoicls_txt),1,1))).squeeze(1)
+            if self.fix_mem is True:
+                adapter_feat = txt_optimized
             else:
-                if self.fix_mem is True:
-                    # adapter_feat = self.attri_weights_to_hoicls @ (self.attri_feats)
-                    adapter_feat = txt_optimized
-                else:
-                    adapter_feat = (self.mem_adapter(txt_optimized.unsqueeze(1),
-                                local_features.flatten(1).mean(-1).unsqueeze(0).unsqueeze(1).repeat(len(self.hoicls_txt),1,1))).squeeze(1)
+                adapter_feat = (self.mem_adapter(txt_optimized.unsqueeze(1),local_features.flatten(1).mean(-1).unsqueeze(0).unsqueeze(1).repeat(len(self.hoicls_txt),1,1))).squeeze(1)
 
             if len(adapter_feat.shape) == 3:
                 adapter_feat = adapter_feat.squeeze()
@@ -1099,14 +967,9 @@ class UPT(nn.Module):
                 else:
                     act_txt_feat = self.origin_text_embeddings.to(adapter_feat.device)
                 
-                if self.dataset == 'hicodet':
-                    act_txt_feat = act_txt_feat[HOI_IDX_TO_ACT_IDX]
-                    act_txt_feat = act_txt_feat / act_txt_feat.norm(dim=-1, keepdim=True)
-                    obj_txt_feat = self.object_embedding[HOI_IDX_TO_OBJ_IDX].to(adapter_feat.device)
-                else:
-                    act_txt_feat = act_txt_feat[[HOI_TO_AO_COCO[i][0] for i in range(236)]]
-                    act_txt_feat = act_txt_feat / act_txt_feat.norm(dim=-1, keepdim=True)
-                    obj_txt_feat = self.object_embedding[[HOI_TO_AO_COCO[i][1] for i in range(236)]].to(adapter_feat.device)
+                act_txt_feat = act_txt_feat[HOI_IDX_TO_ACT_IDX]
+                act_txt_feat = act_txt_feat / act_txt_feat.norm(dim=-1, keepdim=True)
+                obj_txt_feat = self.object_embedding[HOI_IDX_TO_OBJ_IDX].to(adapter_feat.device)
 
                 ho_adapt_feat = self.ho_fuse(torch.cat((act_txt_feat, obj_txt_feat), dim=-1).unsqueeze(0)).squeeze(0)
                 ho_adapter_feat_list.append(ho_adapt_feat)
@@ -1117,10 +980,8 @@ class UPT(nn.Module):
             logits = None
             if 'ho' in self.pred_type:
                 if self.seperate_ho != 0:
-                    img_feat_HO = vis_adapter_feat
                     phi_union_HO =  (vis_adapter_feat @ (ho_adapt_feat).T)
                 else:
-                    img_feat_HO = union_humobj_vis
                     phi_union_HO =  (union_humobj_vis @ adapter_feat.T)
                 if self.wo_unseen_pred is True and self.training is True:
                     phi_union_HO = phi_union_HO[:, self.seen_cls_list]
@@ -1135,7 +996,6 @@ class UPT(nn.Module):
                 logit_scale_U = self.logit_scale_U / 2
             else: 
                 logit_scale_U = self.logit_scale_U
-
 
             if 'u' in self.pred_type:
                 phi_union_U = union_features @ adapter_feat.squeeze(1).T
@@ -1163,7 +1023,6 @@ class UPT(nn.Module):
             pr_i = self.compute_prior_scores(
                 x_keep, y_keep, scores, labels)
          
-
             all_logits.append(logits)
             boxes_h_collated.append(x_keep)
             boxes_o_collated.append(y_keep)
@@ -1175,7 +1034,7 @@ class UPT(nn.Module):
             adapter_feat_list.append(adapter_feat)
         
         return all_logits, prior_collated, boxes_h_collated, boxes_o_collated, object_class_collated, gt_feats_collated, pair_feats_collated, glb_feat_list, adapter_feat_list, ho_adapter_feat_list
-          
+
     def recover_boxes(self, boxes, size):  
         boxes = box_ops.box_cxcywh_to_xyxy(boxes)
         h, w = size
@@ -1194,8 +1053,6 @@ class UPT(nn.Module):
             box_iou(boxes_h, gt_bx_h),
             box_iou(boxes_o, gt_bx_o)
         ) >= self.fg_iou_thresh).unbind(1)
-        # print("pair gt,",len(x),len(y))
-        # IndexError: tensors used as indices must be long, byte or bool tensors
         if self.dataset == 'swig' and self.training:
             if len(y) > 0:
                 tgthoi_y = torch.as_tensor([self.unique_hois[origin_hoi_idx.item()] for origin_hoi_idx in targets['hoi'][y]], device=boxes_h.device)
@@ -1204,7 +1061,6 @@ class UPT(nn.Module):
             labels[x, targets['labels'][y]] = 1  ## target['labels']: verb/action
         else:
             labels[x, targets['hoi'][y]] = 1
-        # print("#(labels==1) = ", torch.sum(labels))
         return labels
 
     def compute_interaction_loss(self, boxes, bh, bo, logits, prior, targets, gt_feats, pair_feats,): ### loss
@@ -1217,12 +1073,9 @@ class UPT(nn.Module):
 
         prior = torch.cat(prior, dim=1).prod(0)
         x, y = torch.nonzero(prior).unbind(1)
-        num_one_label = torch.sum(labels)
         logits = torch.cat(logits) 
         logits = logits[x, y]; prior = prior[x, y]; labels = labels[x, y]
 
-
-        
         n_p = len(torch.nonzero(labels))
 
         if dist.is_initialized():
@@ -1232,13 +1085,9 @@ class UPT(nn.Module):
             dist.all_reduce(n_p)
             n_p = (n_p / world_size).item()
 
-        
         loss = binary_focal_loss_with_logits(
-            torch.log(
-                prior / (1 + torch.exp(-logits) - prior) + 1e-8
-            ), labels, reduction='none',
-            alpha=self.alpha, gamma=self.gamma
-            )
+            torch.log(prior / (1 + torch.exp(-logits) - prior) + 1e-8), labels, reduction='none',
+            alpha=self.alpha, gamma=self.gamma)
 
         if n_p >=1:
             return loss.sum() / n_p, temp_labels
@@ -1248,10 +1097,7 @@ class UPT(nn.Module):
     def prepare_region_proposals(self, results, hidden_state=None): ## √ detr extracts the human-object pairs
         region_props = []
         for bz_i, res in enumerate(results):
-            # if faster_rcnn == False:
             sc, lb, bx = res.values()
-            # else:
-            #     bx, sc, lb = res.values()
 
             keep = batched_nms(bx, sc, lb, 0.5)
             sc = sc[keep].view(-1)
@@ -1303,7 +1149,6 @@ class UPT(nn.Module):
                     hidden_state=hs[keep]
                 ))
 
-
         return region_props
 
     def postprocessing(self, boxes, bh, bo, logits, prior, objects, image_sizes, flag = 0): ### √
@@ -1315,12 +1160,9 @@ class UPT(nn.Module):
         for bx, h, o, lg, pr, obj, size,  in zip(
             boxes, bh, bo, logits, prior, objects, image_sizes,
         ):
-
             pr = pr.prod(0)
             x, y = torch.nonzero(pr).unbind(1)
-            scores = torch.sigmoid(lg[x, y])
-            # if flag == 1:
-            #     pdb.set_trace()      
+            scores = torch.sigmoid(lg[x, y])    
             detections.append(dict(
                 boxes=bx, pairing=torch.stack([h[x], o[x]]),
                 scores=scores * pr[x, y], labels=y,
@@ -1328,7 +1170,6 @@ class UPT(nn.Module):
             ))
 
         return detections
-
 
     def get_prior(self, region_props, image_size, prior_method): ##  for adapter module training
         max_feat = self.priors_initial_dim
@@ -1347,7 +1188,6 @@ class UPT(nn.Module):
             if n_h == 0 or n <= 1:
                 print(n_h,n)
 
-            
             object_embs = self.object_embedding[labels.to(self.object_embedding.device)]
 
             mask[b_idx,:n] = False
@@ -1355,7 +1195,6 @@ class UPT(nn.Module):
             if self.prior_type == 'cbe':
                 priors[b_idx,:n,:5] = torch.cat((scores.unsqueeze(-1),boxes),dim=-1)
                 priors[b_idx,:n,5:self.visual_output_dim+5] = object_embs
-        
             elif self.prior_type == 'cb':
                 priors[b_idx,:n,:5] = torch.cat((scores.unsqueeze(-1),boxes),dim=-1)
             elif self.prior_type == 'ce':
@@ -1395,10 +1234,7 @@ class UPT(nn.Module):
                 )
                 # Valid human-object pairs
                 x_keep, y_keep = torch.nonzero(torch.logical_and(x != y, x < n_h)).unbind(1)
-                if len(x_keep) == 0:
-                    # Should never happen, just to be safe
-                    raise ValueError("There are no valid human-object pairs")
-                
+
                 # extract single roi features
                 sub_prior = instance_wise_prior[x_keep]
                 obj_prior = instance_wise_prior[y_keep]
@@ -1419,7 +1255,9 @@ class UPT(nn.Module):
             mask = torch.zeros((priors.shape[0], priors.shape[1]), dtype=torch.bool,device=region_props[0]['boxes'].device)
 
         return (priors, mask)
-    
+
+    #T_ho(i,j) = (f_h_i + f_o_j)/2 + f_spatial
+    #可以考虑加入小的transformers
     def get_pair_prior(self, region_props, image_size, clip_img=None, drawmask=None): 
         paired_priors_orig = []
         HOI_tokens = []
@@ -1428,37 +1266,42 @@ class UPT(nn.Module):
             boxes, scores, labels, embeds = rp.values()
             n_h = self.check_human_instances(labels)
             n = len(boxes)
-            x, y = torch.meshgrid(
-                    torch.arange(n, device=boxes.device),
-                    torch.arange(n, device=boxes.device)
-                    )
+            x, y = torch.meshgrid(torch.arange(n, device=boxes.device), torch.arange(n, device=boxes.device))
             x_keep, y_keep = torch.nonzero(torch.logical_and(x != y, x < n_h)).unbind(1)
 
             ### generate paired boxes
             sub_boxes = boxes[x_keep]
             obj_boxes = boxes[y_keep]
+            # union boxes
+            union_boxes = torch.zeros_like(sub_boxes)
+            union_boxes[:, 0] = torch.min(sub_boxes[:, 0], obj_boxes[:, 0])
+            union_boxes[:, 1] = torch.min(sub_boxes[:, 1], obj_boxes[:, 1])
+            union_boxes[:, 2] = torch.max(sub_boxes[:, 2], obj_boxes[:, 2])
+            union_boxes[:, 3] = torch.max(sub_boxes[:, 3], obj_boxes[:, 3])
+            eps = 1e-6
+            area_h_u = box_intersection_area(sub_boxes, union_boxes)
+            area_o_u = box_intersection_area(obj_boxes, union_boxes)
+            # sqrt-normalized weights
+            w_h = torch.sqrt(area_h_u + eps)
+            w_o = torch.sqrt(area_o_u + eps)
+            alpha = w_h / (w_h + w_o + eps)   # shape [N]
+            alpha = alpha.unsqueeze(-1)       # [N, 1]
+            human_embeds = embeds[x_keep]    # [N, D]
+            object_embeds = embeds[y_keep]   # [N, D]
+            ho_embed = alpha * human_embeds + (1 - alpha) * object_embeds
             paired_boxes.append((sub_boxes, obj_boxes))
-
-
-            pairwise_spatial = compute_spatial_encodings(
-            [boxes[x_keep],], [boxes[y_keep],], [image_size[i],]
-            )   
+            pairwise_spatial = compute_spatial_encodings([boxes[x_keep],], [boxes[y_keep],], [image_size[i],])   
 
             obji_HO_pair_text_embeddings = [self.HO_pair_prior_text_embeddings[i].to(pairwise_spatial.device) for i in labels[y_keep].tolist()]
             object_embs = self.object_embedding.to(pairwise_spatial.device)[torch.tensor(labels[y_keep])]
             
             if self.pt_init == 'pos+detr':
                 spatial_embeddings = self.pt_posenc_head(pairwise_spatial)
-                HOI_token = (embeds[x_keep] + embeds[y_keep])/2 + spatial_embeddings
-            elif self.pt_init == 'pos':
-                spatial_embeddings = self.pt_posenc_head(pairwise_spatial)
-                HOI_token = spatial_embeddings
-            elif self.pt_init == 'detr':
-                HOI_token = (embeds[x_keep] + embeds[y_keep])/2
+                # HOI_token = (embeds[x_keep] + embeds[y_keep])/2 + spatial_embeddings
+                HOI_token = ho_embed + spatial_embeddings
             elif self.pt_init == 'pos+detr+fus':
                 HOI_token = self.pt_token_fus((embeds[x_keep]+ embeds[y_keep]).unsqueeze(0)/2, pairwise_spatial.unsqueeze(0)).squeeze(0)
             HOI_tokens.append(HOI_token)
-
             paired_priors_orig.append([torch.cat((pr_txt_i, object_embs[idx].unsqueeze(0))) for idx, pr_txt_i in enumerate(obji_HO_pair_text_embeddings)]) ### batch * HO-num * prior-num * dim
 
         pt_adapter_feats = []
@@ -1490,12 +1333,9 @@ class UPT(nn.Module):
             pt_adapter_feat = self.pt_spacial_proj(pt_adapter_feat)
             pt_adapter_feat = self.pt_spacial_proj_norm(pt_adapter_feat)
 
-
             pt_adapter_feats.append(pt_adapter_feat)
             
-    
         return pt_adapter_feats, interact_feat_list
-
 
     def check_human_instances(self, labels):
         is_human = labels == self.human_idx
@@ -1521,7 +1361,6 @@ class UPT(nn.Module):
                     tgt_ids.append(hoi_id)
         tgt_ids = torch.as_tensor(tgt_ids, dtype=torch.int64, device=device)
         return unique_hois
-
 
     def forward(self,
         images: List[Tensor],
@@ -1556,79 +1395,33 @@ class UPT(nn.Module):
         """
         if not self.finetune_adapter:
             raise NotImplementedError
-            if self.training and targets is None:
-                raise ValueError("In training mode, targets should be passed")
-            image_sizes = torch.as_tensor([
-                im.size()[-2:] for im in images
-            ], device=images[0].device)
-            region_props = self.get_region_proposals(targets)  # exhaustively generate the human-object pairs from the detr results
-            feat_local_old = self.clip_model.encode_image(images[0])
-            feat_local = feat_local_old[:,1:,:].transpose(1,2).view(feat_local_old.shape[0],-1, 7, 7).float()
-            cls_feature = feat_local_old[:,0,:]
-            # use the gt crop
-            
-            if self.evaluate_type == 'gt':
-                if self.use_type == 'crop':
-                    logits, prior, bh, bo, objects, boxes = self.compute_roi_embeddings_targets(cls_feature.unsqueeze(0), image_sizes, targets)
-                else: #### ignore 
-                    logits, prior, bh, bo, objects = self.compute_roi_embeddings(feat_local, image_sizes, region_props)
-            elif self.evaluate_type == 'detr':      
-                logits, prior, bh, bo, objects, = self.compute_crop_embeddings(cls_feature.unsqueeze(0), image_sizes, region_props, targets)
-                boxes = [r['boxes'] for r in region_props]
-            # boxes = [r['boxes'] for r in region_props]
-            
-            if self.training:
-                interaction_loss, _ = self.compute_interaction_loss(boxes, bh, bo, logits, prior, targets, interactiveness)
-                loss_dict = dict(
-                    interaction_loss=interaction_loss
-                )
-                return loss_dict
-            
-            detections = self.postprocessing(boxes, bh, bo, logits, prior, objects, image_sizes)
-            return detections
+        
         else:
             if self.training and targets is None:
                 raise ValueError("In training mode, targets should be passed")
-            batch_size = len(images)
             images_orig = [im[0].float() for im in images]
             images_clip = [im[1] for im in images]
 
             device = images_clip[0].device
-            image_sizes = torch.as_tensor([
-                im.size()[-2:] for im in images_clip
-            ], device=device)
-            image_sizes_orig = torch.as_tensor([
-                im.size()[-2:] for im in images_orig
-                ], device=device)
+            image_sizes = torch.as_tensor([im.size()[-2:] for im in images_clip], device=device)
             
-            if self.dataset == 'swig':
-                ## boxes should be xyxy in the origin whwh coordinate space
-                outputs = self.detector(images_orig)
-                detections = self.postprocessor(
-                    outputs, image_sizes
-                )
-                results = detections
-                
-            else:
-
-                # assert mask is not None2
-                if isinstance(images_orig, (list, torch.Tensor)):
-                    images_orig = nested_tensor_from_tensor_list(images_orig)
-                features, pos = self.detector.backbone(images_orig)
-                src, mask = features[-1].decompose()
-                hs, detr_memory = self.detector.transformer(self.detector.input_proj(src), mask, self.detector.query_embed.weight, pos[-1])
+            if isinstance(images_orig, (list, torch.Tensor)):
+                images_orig = nested_tensor_from_tensor_list(images_orig)
+            features, pos = self.detector.backbone(images_orig)
+            src, mask = features[-1].decompose()
+            hs, detr_memory = self.detector.transformer(self.detector.input_proj(src), mask, self.detector.query_embed.weight, pos[-1])
     
-                outputs_class = self.detector.class_embed(hs) # 6x8x100x81 or 6x8x100x92
-                outputs_coord = self.detector.bbox_embed(hs).sigmoid() # 6x8x100x4 
+            outputs_class = self.detector.class_embed(hs) # 6x8x100x81 or 6x8x100x92
+            outputs_coord = self.detector.bbox_embed(hs).sigmoid() # 6x8x100x4 
 
-                if outputs_class.shape[-1] == 92:
-                    outputs_class = outputs_class[:, :, :, self.reserve_indices]
-                    assert outputs_class.shape[-1] == 81, 'reserved shape NOT match 81'
+            if outputs_class.shape[-1] == 92:
+                outputs_class = outputs_class[:, :, :, self.reserve_indices]
+                assert outputs_class.shape[-1] == 81, 'reserved shape NOT match 81'
 
-                results = {'pred_logits': outputs_class[-1], 'pred_boxes': outputs_coord[-1]}
-         
-                results = self.postprocessor(results, image_sizes)
-                region_props = self.prepare_region_proposals(results, hidden_state=hs[-1])
+            results = {'pred_logits': outputs_class[-1], 'pred_boxes': outputs_coord[-1]}
+        
+            results = self.postprocessor(results, image_sizes)
+            region_props = self.prepare_region_proposals(results, hidden_state=hs[-1])
 
             if self.use_insadapter:
                 priors = self.get_prior(region_props,image_sizes.to(region_props[0]['labels'].device), self.prior_method) ## priors: (prior_feat, mask): (batch_size*14*64, batch_size*14)
@@ -1638,7 +1431,6 @@ class UPT(nn.Module):
                 priors = None
 
             images_clip = nested_tensor_from_tensor_list(images_clip)
-            feat_new = None
             context = None  
 
             if self.ho_pair_pt is True:
@@ -1646,14 +1438,8 @@ class UPT(nn.Module):
             else:
                 pt_adapter_feats = None
             
-
             feat_global, feat_local, paired_tokens = self.clip_head.image_encoder(images_clip.decompose()[0], priors, context=context, pair_prior = (pt_adapter_feats, None))   
 
-
-            if self.dataset == 'swig' and self.training:
-                self.unique_hois = self.prepare_target_hois(targets=targets, device=device)
-                self.num_classes = len(self.unique_hois)
- 
             logits, prior, bh, bo, objects, gt_feats, pair_feats, glb_feat, adapter_feat_list, ho_adapter_feat_list = self.compute_roi_embeddings(feat_local, image_sizes, region_props, targets = targets, fix_mem=self.fix_mem, vcoco = self.vcoco, images = images, paired_tokens=paired_tokens)
             gt_all_logits = None
             boxes = [r['boxes'] for r in region_props] 
@@ -1668,11 +1454,8 @@ class UPT(nn.Module):
                     hum_embeddings = [[] for i in range(self.num_classes)]
                     real_verbs = [[] for i in range(self.num_classes)]
                     hoi_clses = [[] for i in range(self.num_classes)]
-                    filenames = list(annotation.keys())
-                    # verbs_iou = [[] for i in range(self.num_classes)]
                     from hico_text_label import HOI_TO_AO
                     if 'COCO' in targets[0]['filename']:
-                        # MAP_AO_TO_HOI = MAP_AO_TO_HOI_COCO
                         HOI_TO_AO = HOI_TO_AO_COCO
                     for tgti in range(len(targets)):
                         anno = annotation[targets[tgti]['filename']]
@@ -1695,7 +1478,6 @@ class UPT(nn.Module):
                         for i, v in enumerate(verbs):
                             if 'hico' in self.file1: ## TODO ??? why vcoco list idx out of range
                                 if self.num_classes == 117:
-                                    # pdb.set_trace()
                                     if anno['verbs'][i] not in self.object_class_to_target_class[anno['objects'][i]]:
                                         continue
                                 elif self.num_classes == 600:
@@ -1717,7 +1499,6 @@ class UPT(nn.Module):
                                     obj_embeddings[v_append].append(anno['object_features'][rand_ind] / np.linalg.norm(anno['object_features'][rand_ind]))
                                     hum_embeddings[v_append].append(anno['huamn_features'][rand_ind] / np.linalg.norm(anno['huamn_features'][rand_ind]))
                                     real_verbs[v_append].append(anno['real_verbs'][rand_ind])
-                                    # pdb.set_trace()
                                     if 'HICO' in targets[tgti]['filename']:
                                         hoi_clses[v_append].append(MAP_AO_TO_HOI[anno['verbs'][rand_ind], anno['objects'][rand_ind]])
                                     else:
@@ -1761,7 +1542,6 @@ class UPT(nn.Module):
                         real_verbs_lst.append(real_v)
                         target_cls_list.append(hoi_c)
   
-
                     target_classes_label = torch.cat(target_cls_list, dim=0).type(torch.long).to(device)
                     unseen_list = [j for j in self.filtered_hoi_idx if HOI_TO_AO[j][1] in [HOI_TO_AO[i.item()][1] for i in target_classes_label]]
                     if self.dataset != 'vcoco':
@@ -1790,7 +1570,6 @@ class UPT(nn.Module):
                             txtall_similar = cal_similarity(torch.cat((self.hoicls_txt.to(device)[target_classes_label], txt_unseen), dim=0),
                                                         torch.cat((self.hoicls_txt.to(device)[target_classes_label], txt_unseen), dim=0))
 
-
                             if self.seperate_ho != 0:
                                 vis_unseen2 = ho_adapter_feat_list[select_semloss_index][unseen_list]
                                 visunseen_similar2 = cal_similarity(vis_unseen2, vis_unseen2)
@@ -1803,18 +1582,9 @@ class UPT(nn.Module):
                                 relation_ho_cls_unseen = kl_loss(visunseen_similar, txtunseen_similar)
                                 relation_ho_cls_all = kl_loss(visall_similar, txtall_similar)
 
-
-                            loss_dict = dict(
-                                interaction_loss=interaction_loss,
-                                sem_loss = (relation_ho_cls_seen+relation_ho_cls_unseen+relation_ho_cls_all)/3*self.semloss_weight,
-                            )
+                            loss_dict = dict(interaction_loss=interaction_loss, sem_loss = (relation_ho_cls_seen+relation_ho_cls_unseen+relation_ho_cls_all)/3*self.semloss_weight)
                         else:
-                            loss_dict = dict(
-                                interaction_loss=interaction_loss,
-                                sem_loss = (relation_ho_cls_seen)*self.semloss_weight,
-                            )
-                    else:
-                        loss_dict = dict(interaction_loss=interaction_loss)
+                            loss_dict = dict(interaction_loss=interaction_loss, sem_loss = (relation_ho_cls_seen)*self.semloss_weight)
                 else:
                     loss_dict = dict(interaction_loss=interaction_loss)
                 
@@ -1834,9 +1604,6 @@ class UPT(nn.Module):
                         tempc = tempc * (torch.ones_like(tempc).to(tempc.device) - torch.eye(len(tempc)).to(tempc.device))
                         loss_dict['loss_w_unique'] = torch.abs(tempc).sum()*0.001
 
-                    # tempe = self.hoicls_w.T.softmax(dim=-1)
-                    # loss_dict['loss_w_entropy'] = -(tempe*torch.log(tempe)).sum(dim=-1).mean() * 0.3
-
                     if self.disentangle_basis is True:
                         tempa = self.basis_feat / self.basis_feat.norm(dim=-1, keepdim=True)
                         tempa = tempa @ tempa.T 
@@ -1846,17 +1613,8 @@ class UPT(nn.Module):
 
                     if isinstance(adapter_feat_list, list):
                         adapter_feat_list = torch.stack(adapter_feat_list, dim=0)
-                    all_hoi_list = (target_classes_label.tolist() + unseen_list)
-                    # adapted_weight = adapter_feat_list[:, all_hoi_list] @ torch.pinverse(self.basis_feat)
-                    # adapted_weight = adapted_weight.mean(dim=0)
-                    # adapted_weight = adapted_weight / adapted_weight.norm(dim=-1, keepdim=True)
-
-                    origini_weight = self.hoicls_w / self.hoicls_w.norm(dim=-1, keepdim=True)
                         
                     if self.no_act_constraint is False:
-                        # if self.zs_type in ['rare_first', 'non_rare_first'] and len(self.filtered_hoi_idx) > 0: 
-                        #     loss_dict['loss_actw_similar'] = kl_loss(adapted_weight_actpart[all_hoi_list], act_weight[all_hoi_list]) * 50
-                        # else:
                         all_logit = torch.cat(logits)
                         all_lb = torch.cat(labels_matched)
                         all_prior = torch.cat(prior, dim=1).prod(0)
@@ -1870,7 +1628,6 @@ class UPT(nn.Module):
                             rare_list = [j for j in RARE_HOI_IDX if HOI_TO_AO[j][1] in [HOI_TO_AO[i.item()][1] for i in target_classes_label]]
                         else:
                             rare_list = []
-             
 
                     if self.ao_sep_basis is True:
                         temp_actcls_w = self.actcls_w
@@ -1892,14 +1649,11 @@ class UPT(nn.Module):
                             tempa = tempa @ tempa.T
                             loss_dict['disentangle_basis_act'] = torch.abs(tempa).sum()*0.001 
 
-                        
                         adapted_weight = (adapter_feat_list @ torch.pinverse(self.basis_feat)).mean(dim=0)
                         adapted_weight_actpart = adapted_weight[:, self.act_related_index] 
                         adapted_weight_actpart = adapted_weight_actpart / adapted_weight_actpart.norm(dim=-1, keepdim=True)
-                        if self.dataset == 'hicodet':
-                            act_weight = self.actcls_w[HOI_IDX_TO_ACT_IDX]
-                        else:
-                            act_weight = self.actcls_w[[HOI_TO_AO_COCO[i][0] for i in range(236)]]
+                        
+                        act_weight = self.actcls_w[HOI_IDX_TO_ACT_IDX]
                         act_weight = act_weight / act_weight.norm(dim=-1, keepdim=True)
                         if self.fix_act_w is True:
                             act_weight = act_weight.clone().detach()
@@ -1915,25 +1669,17 @@ class UPT(nn.Module):
                                 loss_dict['loss_actw_similar'] = loss_dict['loss_actw_similar'] + kl_loss(adapted_weight_actpart[rare_list], act_weight[rare_list], T=self.kl_t) * 50
 
                         if self.seperate_ho != 0:
-                            
                             ho_adapter_feat_l = torch.stack(ho_adapter_feat_list, dim=0).mean(dim=0)
                             ho_adapter_feat_l = ho_adapter_feat_l[:, :(ho_adapter_feat_l.shape[-1])//2]
                             if self.basis_feat_constraint == 'none':
-                                if self.dataset == 'hicodet': 
-                                    adapted_weight_human = ho_adapter_feat_l @ torch.pinverse(self.basis_feat[self.act_related_index])
-                                else:
-                                    adapted_weight_human = ho_adapter_feat_l @ torch.pinverse(self.basis_feat[self.act_related_index])   
+                                adapted_weight_human = ho_adapter_feat_l @ torch.pinverse(self.basis_feat[self.act_related_index])
                             else:
-                                if self.dataset == 'hicodet':
-                                    adapted_weight_human = ho_adapter_feat_l @ torch.pinverse(self.act_basis_feat)
-                                else:
-                                    adapted_weight_human = ho_adapter_feat_l @ torch.pinverse(self.act_basis_feat)
+                                adapted_weight_human = ho_adapter_feat_l @ torch.pinverse(self.act_basis_feat)
                             adapted_weight_human = adapted_weight_human / adapted_weight_human.norm(dim=-1, keepdim=True)
 
                             if self.no_act_constraint is False:
                                 if len(unconf_act) > 0:
                                     loss_dict['loss_actw_similar2'] = (kl_loss(adapted_weight_human[target_classes_label.tolist()], act_weight[target_classes_label.tolist()], reduction='none', T=self.kl_t).sum(-1) * seenact_conf_w).sum()
-                                    
                                 else:
                                     loss_dict['loss_actw_similar2'] = kl_loss(adapted_weight_human[target_classes_label.tolist()], act_weight[target_classes_label.tolist()], T=self.kl_t) * 50 / 5 
                                 if len(unseen_list) > 0:
@@ -1941,10 +1687,6 @@ class UPT(nn.Module):
                                 if len(rare_list) > 0:
                                     loss_dict['loss_actw_similar2'] = loss_dict['loss_actw_similar2'] + kl_loss(adapted_weight_human[rare_list], act_weight[rare_list], T=self.kl_t) * 50
 
-
-                # print(sum(loss for loss in loss_dict.values()))
-                # print(loss_dict)
-                # import pdb; pdb.set_trace()
                 return loss_dict
   
             if len(logits) == 0:
@@ -1955,9 +1697,19 @@ class UPT(nn.Module):
 
             return detections
 
+def box_intersection_area(box1, box2):
+        """
+        box: (..., 4) with (x1, y1, x2, y2)
+        return: (...,)
+        """
+        x1 = torch.max(box1[..., 0], box2[..., 0])
+        y1 = torch.max(box1[..., 1], box2[..., 1])
+        x2 = torch.min(box1[..., 2], box2[..., 2])
+        y2 = torch.min(box1[..., 3], box2[..., 3])
 
-
-
+        inter_w = (x2 - x1).clamp(min=0)
+        inter_h = (y2 - y1).clamp(min=0)
+        return inter_w * inter_h
 
 def plot_tsne(all_features, HOII_l, object_labels, action_labels, title='t-SNE Visualization', savepth = 'temp.jpg'):
     
@@ -1968,8 +1720,6 @@ def plot_tsne(all_features, HOII_l, object_labels, action_labels, title='t-SNE V
     tsne = TSNE(n_components=2, random_state=42, perplexity=5)
     features_2d = tsne.fit_transform(all_features)
 
-    # features_2d = [ features_2d[i] for i in range(len(features_2d)) if i in HOII_l]
-    # features_2d = np.vstack(features_2d)
     # 设置颜色和形状的选择
     unique_objects = np.unique(object_labels)
     unique_actions = np.unique(action_labels)
@@ -2016,7 +1766,6 @@ def plot_tsne(all_features, HOII_l, object_labels, action_labels, title='t-SNE V
     plt.savefig(savepth, dpi=300, bbox_inches='tight')
     plt.close()
 
-
 def random_color():
     rdn = random.randint(1, 1000)
     b = int(rdn * 997) % 255
@@ -2054,7 +1803,6 @@ def kl_loss(prediction, targets, reduction='sum', T = 0.1):
              F.log_softmax(targets / T, dim=1),  # 1.2 0.1 0.2 0.3
              reduction=reduction, log_target=True) / prediction.numel()
 
-
 def euclidean_dist(x, y):
     m, n = x.size(0), y.size(0)
     xx = torch.pow(x, 2).sum(1, keepdim=True).expand(m, n)
@@ -2080,8 +1828,6 @@ def get_multi_prompts(classnames):   ## https://github.com/openai/CLIP/blob/main
         all_texts_input.append(texts_input)
     all_texts_input = torch.stack(all_texts_input,dim=0)
     return all_texts_input
-
-
 
 @torch.no_grad()
 def get_origin_text_emb(args, clip_model, tgt_class_names, obj_class_names):
@@ -2110,122 +1856,108 @@ def get_origin_text_emb(args, clip_model, tgt_class_names, obj_class_names):
     else:
         return origin_text_embedding
 
-
 def build_detector(args, class_corr, object_n_verb_to_interaction, clip_model_path, num_anno, verb2interaction=None):
-
+    print("[Step 1] Start building DETR model...")
     detr, _, postprocessors = build_model(args)
+    print("[Step 2] DETR model built.")
+
     if os.path.exists(args.pretrained):
         if dist.get_rank() == 0:
-            print(f"Load weights for the object detector from {args.pretrained}")
-            # pdb.set_trace()
+            print(f"[Step 3] Load weights for the object detector from {args.pretrained}")
         if 'e632da11' in args.pretrained:
             detr.load_state_dict(torch.load(args.pretrained, map_location='cpu')['model']) 
         else:
             detr.load_state_dict(torch.load(args.pretrained, map_location='cpu')['model_state_dict'])
+    print("[Step 4] DETR weights loaded.")
 
-
+    print("[Step 5] Loading CLIP model...")
     clip_state_dict = torch.load(clip_model_path, map_location="cpu").state_dict()
-    clip_model = CLIP_models_adapter_prior2.build_model(state_dict=clip_state_dict, use_adapter=args.use_insadapter, adapter_pos=args.adapter_pos, adapter_num_layers=args.adapter_num_layers,pt_attn=args.pt_attn, pt_learn = args.pt_learn, pt_lyr = args.pt_lyr)
+    clip_model = CLIP_models_adapter_prior2.build_model(
+        state_dict=clip_state_dict, 
+        use_adapter=args.use_insadapter, 
+        adapter_pos=args.adapter_pos, 
+        adapter_num_layers=args.adapter_num_layers,
+        pt_attn=args.pt_attn, 
+        pt_learn=args.pt_learn, 
+        pt_lyr=args.pt_lyr
+    )
+    print("[Step 6] CLIP model loaded.")
 
     if args.num_classes == 117:
         classnames = hico_verbs_sentence
-    elif args.num_classes == 24:
-        classnames = vcoco_verbs_sentence
     elif args.num_classes == 600:
         classnames = list(hico_text_label.hico_text_label.values())
     else:
         raise NotImplementedError
+    print(f"[Step 7] Number of classes: {args.num_classes}")
+
     model = CustomCLIP(args, classnames=classnames, clip_model=clip_model)
+    print("[Step 8] CustomCLIP model initialized.")
 
     obj_class_names = [obj[1] for obj in hico_text_label.hico_obj_text_label]
 
     if args.dataset == 'swig' and not args.LA and 'e' not in args.prior_type:
         origin_text_embeddings = None
-        object_embedding = torch.rand(1000, 1)
+        print("[Step 9] Using swig dataset, origin_text_embeddings set to None.")
     else:
         if args.act_txtdecrip is False:
-            origin_text_embeddings, object_embedding = get_origin_text_emb(args, clip_model=clip_model, tgt_class_names=classnames, obj_class_names=obj_class_names)
+            print("[Step 9] Getting original text embeddings...")
+            origin_text_embeddings, object_embedding = get_origin_text_emb(
+                args, clip_model=clip_model, tgt_class_names=classnames, obj_class_names=obj_class_names
+            )
+            print("[Step 10] Original text embeddings obtained.")
         else:
-            if args.dataset =='hicodet':
-                file_path = ("hoi_txtdescrip/llama_action_descrip_hicodet.txt")
-            elif args.dataset =='vcoco':
-                file_path = ("hoi_txtdescrip/llama_action_descrip_vcoco.txt")
-            
+            print("[Step 9] Loading action descriptions for text embeddings...")
+            file_path = "hoi_txtdescrip/llama_action_descrip_hicodet.txt"
             act_txtdescrip = {}
             with open(file_path, 'r') as file:
-                lines = file.readlines()
-                lines = [line.rstrip() for line in lines if line.rstrip()]
-            for l_idx,line_i in enumerate(lines):
+                lines = [line.rstrip() for line in file.readlines() if line.rstrip()]
+            for l_idx, line_i in enumerate(lines):
                 if line_i[0].isdigit():
                     act = int(line_i)
                     cur_key = act
                     act_txtdescrip[cur_key] = ''
                 elif line_i[0] == "*":
                     act_txtdescrip[cur_key] += line_i[2:] + '. '
-
-            origin_text_embeddings, object_embedding = get_origin_text_emb(args, clip_model=clip_model, tgt_class_names=list(act_txtdescrip.values()), obj_class_names=obj_class_names)
+            origin_text_embeddings, object_embedding = get_origin_text_emb(
+                args, clip_model=clip_model, tgt_class_names=list(act_txtdescrip.values()), obj_class_names=obj_class_names
+            )
+            print("[Step 10] Text embeddings from action descriptions obtained.")
 
         origin_text_embeddings = origin_text_embeddings.clone().detach()
         object_embedding = object_embedding.clone().detach()
+        print("[Step 11] Text embeddings cloned and detached.")
 
         if args.llmtxt is True:
+            print("[Step 12] llmtxt enabled, processing HOI class descriptions...")
             if args.dataset == 'hicodet':
-                f2 = open("hoi_txtdescrip/hico_HOI_descrip.txt","r")
+                f2 = open("hoi_txtdescrip/hico_HOI_descrip.txt", "r")
                 cls_descrip = []
                 lines = f2.readlines()
                 count = 0
                 for line_i in lines:
-                    if count %3 == 1:
-                        cls_descrip.append(list(hico_text_label.hico_text_label.values())[int(count/3)] +\
-                                            ":" + line_i.split(":")[1][:-1])
+                    if count % 3 == 1:
+                        cls_descrip.append(
+                            list(hico_text_label.hico_text_label.values())[int(count / 3)] + ":" + line_i.split(":")[1][:-1]
+                        )
                     count += 1
-            elif args.dataset == 'vcoco':
-                file_path = ("hoi_txtdescrip/vcoco_hoi_text_description.txt")   
-                cls_descrip = []
-                with open(file_path, 'r') as file:
-                    lines = file.readlines()
-                    lines = [line.rstrip() for line in lines if line.rstrip()]
-
-                hico_txt_description = {}
-                cur_key = 0
-                for l_idx,line_i in enumerate(lines):
-                    if line_i[0] == '(' and line_i[1].isdigit():
-                        
-                        act, obj = line_i.split(",")
-                        act = int(act[1:])
-                        obj = int(obj[1:-1])
-                        if args.dataset =='hicodet':
-                            hoii = MAP_AO_TO_HOI[act, obj]
-                        else:
-                            hoii = MAP_AO_TO_HOI_COCO[(act, obj)]
-    
-                        cur_key = hoii
-                        hico_txt_description[cur_key] = ''
-                    else:
-                        hico_txt_description[cur_key] += line_i + ' '
-
-                for  hoii in (hico_txt_description):
-                    tnt_dep = hico_txt_description[hoii][:300]
-                    quit_len = len(tnt_dep.split(".")[-1])
-                    if quit_len > 0:
-                        tnt_dep = tnt_dep[:-quit_len]
-                    if args.dataset =='hicodet':
-                        cls_descrip.append(list(hico_text_label.hico_text_label.values())[int(hoii)] +\
-                                            ":" +tnt_dep)
-    
-                    else:
-                        cls_descrip.append((vcoco_hoi_text_label)[HOI_TO_AO_COCO[int(hoii)]] +\
-                                            ":" +tnt_dep)
             hoicls_txt, _ = get_origin_text_emb(args, clip_model=clip_model, tgt_class_names=cls_descrip, obj_class_names=obj_class_names)
+            print("[Step 13] HOI class text embeddings obtained with llmtxt.")
         else:
-            hoicls_txt, _ = get_origin_text_emb(args, clip_model=clip_model, tgt_class_names=list(hico_text_label.hico_text_label.values()), obj_class_names=obj_class_names)
-    
-        if args.ho_pair_pt is True:
-            with open("hoi_txtdescrip/hico_ho_corepoint.jsonl", "r") as f:
-                round1_ans = [(json.loads(line))['response']['body']['choices'][0]['message']['content'].split("\n") for line in f]
+            hoicls_txt, _ = get_origin_text_emb(
+                args, clip_model=clip_model, tgt_class_names=list(hico_text_label.hico_text_label.values()), obj_class_names=obj_class_names
+            )
+            print("[Step 13] HOI class text embeddings obtained without llmtxt.")
 
+        if args.ho_pair_pt is True:
+            print("[Step 14] Processing HO pair text embeddings...")
+            with open("hoi_txtdescrip/hico_ho_corepoint.jsonl", "r") as f:
+                round1_ans = [
+                    (json.loads(line))['response']['body']['choices'][0]['message']['content'].split("\n") 
+                    for line in f
+                ]
             HO_pair_text = {}
-            for l_idx,ans_i in enumerate(round1_ans):
+            for l_idx, ans_i in enumerate(round1_ans):
                 HO_pair_text[l_idx] = {}
                 flag = -1
                 for line_i in ans_i:
@@ -2238,7 +1970,6 @@ def build_detector(args, class_corr, object_n_verb_to_interaction, clip_model_pa
                     elif "object description" in line_i_temp.lower():
                         HO_pair_text[l_idx]["object"] = []
                         flag = 1
-      
                     else:
                         if flag == 0:
                             HO_pair_text[l_idx]["human"].append(line_i_temp)
@@ -2250,20 +1981,26 @@ def build_detector(args, class_corr, object_n_verb_to_interaction, clip_model_pa
 
             HO_pair_text_embeddings = []
             for key in HO_pair_text:
-                HO_pair_text_inputs = torch.cat([clip.tokenize(text_i, context_length=77, truncate=True) for idx, text_i in enumerate(list(HO_pair_text[key].values()))]) 
-
+                HO_pair_text_inputs = torch.cat([
+                    clip.tokenize(text_i, context_length=77, truncate=True) 
+                    for idx, text_i in enumerate(list(HO_pair_text[key].values()))
+                ]) 
                 with torch.no_grad():
                     HO_pair_text_embedding = clip_model.encode_text(HO_pair_text_inputs)
                     HO_pair_text_embedding = HO_pair_text_embedding / HO_pair_text_embedding.norm(dim=-1, keepdim=True)
                 HO_pair_text_embeddings.append(HO_pair_text_embedding)
-
+            print("[Step 15] HO pair text embeddings computed.")
         else:
             HO_pair_text_embeddings = None
+            print("[Step 15] HO pair text embeddings not used.")
 
         args.feat_dim = hoicls_txt.shape[-1]        
         hoicls_txt = hoicls_txt.clone().detach()
+        print("[Step 16] HOI class embeddings cloned and detached.")
 
-    detector = UPT(args,
+    print("[Step 17] Initializing UPT detector...")
+    detector = UPT(
+        args,
         detr, postprocessors['bbox'], model, origin_text_embeddings, object_embedding,
         human_idx=args.human_idx, num_classes=args.num_classes,
         alpha=args.alpha, gamma=args.gamma,
@@ -2273,8 +2010,9 @@ def build_detector(args, class_corr, object_n_verb_to_interaction, clip_model_pa
         max_instances=args.max_instances,
         object_class_to_target_class=class_corr,
         object_n_verb_to_interaction=object_n_verb_to_interaction,
-        num_anno = num_anno,
-        hoicls_txt = hoicls_txt,
-        HO_pair_text_embeddings = HO_pair_text_embeddings
+        num_anno=num_anno,
+        hoicls_txt=hoicls_txt,
+        HO_pair_text_embeddings=HO_pair_text_embeddings
     )
+    print("[Step 18] UPT detector initialized successfully.")
     return detector

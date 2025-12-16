@@ -1,12 +1,25 @@
-# dir 不需要提交的目录
-/checkpoints
-/__pycache__
-/params
+# Python
+__pycache__/
+*.py[cod]
 
+# Jupyter
+.ipynb_checkpoints/
 
-# log 不需要提交的任意包含后缀名为log的文件
+# Checkpoints / models
+checkpoints/
+*.pth
+*.pt
+*.ckpt
+*.pkl
+
+# Large datasets (local only)
+hicodet/hico_20160224_det/
+hicodet_pkl_files/
+
+# Logs
+logs/
 *.log
-*.pyc
 
-# Package Files 不需要提交的任意包含后缀名为jar的文件
-# *.jar
+# OS
+.DS_Store
+

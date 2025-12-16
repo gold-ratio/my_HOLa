@@ -1,3 +1,6 @@
+#【视觉分支】 一个修改版的 CLIP 视觉编码器
+# 里面包含了 Adapter（适配器）和 Prior（先验知识）的注入逻辑
+
 from collections import OrderedDict
 from typing import Tuple, Union
 
@@ -116,34 +119,15 @@ class TransformerDecoderLayer(nn.Module):
         return self.forward_post(tgt, memory, tgt_mask, memory_mask,
                                  tgt_key_padding_mask, memory_key_padding_mask, pos, query_pos)
 
-
-
 import copy
 def _get_clones(module, N):
     return nn.ModuleList([copy.deepcopy(module) for i in range(N)])
-
-# class PositionAwareAttention(nn.Module):
-#     def __init__(self, feature_dim, num_heads=8):
-#         super().__init__()
-#         self.attn = nn.MultiheadAttention(embed_dim=feature_dim, num_heads=num_heads)
-#         # self.lambda_factor = lambda_factor
-
-#     def forward(self, clip_tokens, object_prompts, attention_mask):
-#         # 计算 box distance 并转换成 attention mask
-#         # box_distances = compute_box_distance(boxes, patch_grid)  # (batch, num_objects, num_patches)
-#         # attention_mask = compute_attention_mask(box_distances, self.lambda_factor)  # (batch, num_objects, num_patches)
-
-#         # 计算 attention，其中 object_prompts 作为 Query
-#         attn_output, _ = self.attn(object_prompts, clip_tokens, clip_tokens, attn_mask=attention_mask)
-#         return attn_output
-
 
 class Extractor(nn.Module):
     def __init__(self, d_model, bottleneck, dropout,):
         super().__init__()
         '''
         update prior using F_vit
-
         K, V: F_vit
         Q: prior
         '''
@@ -162,7 +146,6 @@ class Extractor(nn.Module):
         context = self.down_proj(F_vit) # 197 x batchsize x down_size
         new_prior = self.mhsa(tgt=query, memory=context,)
         return (new_prior.transpose(0,1), mask)
-
 
 class Adapter(nn.Module):
     def __init__(self,
@@ -276,7 +259,6 @@ class Bottleneck(nn.Module):
         out = self.relu3(out)
         return out
 
-
 class AttentionPool2d(nn.Module):
     def __init__(self, spacial_dim: int, embed_dim: int, num_heads: int, output_dim: int = None):
         super().__init__()
@@ -332,9 +314,6 @@ class AttentionPool2d(nn.Module):
         feature_map = x[:, :, 1:].reshape(B, -1, H, W)
         return global_feat, feature_map
 
-        # return x[0]
-
-
 class ModifiedResNet(nn.Module):
     """
     A ResNet class that is similar to torchvision's but contains the following changes:
@@ -342,12 +321,10 @@ class ModifiedResNet(nn.Module):
     - Performs anti-aliasing strided convolutions, where an avgpool is prepended to convolutions with stride > 1
     - The final pooling layer is a QKV attention instead of an average pool
     """
-
     def __init__(self, layers, output_dim, heads, input_resolution=224, width=64):
         super().__init__()
         self.output_dim = output_dim
         self.input_resolution = input_resolution
-
         # the 3-layer stem
         self.conv1 = nn.Conv2d(3, width // 2, kernel_size=3, stride=2, padding=1, bias=False)
         self.bn1 = nn.BatchNorm2d(width // 2)
@@ -359,7 +336,6 @@ class ModifiedResNet(nn.Module):
         self.bn3 = nn.BatchNorm2d(width)
         self.relu3 = nn.ReLU(inplace=True)
         self.avgpool = nn.AvgPool2d(2)
-
         # residual layers
         self._inplanes = width  # this is a *mutable* variable used during construction
         self.layer1 = self._make_layer(width, layers[0])
@@ -430,9 +406,6 @@ class ModifiedResNet(nn.Module):
             print(x_old.shape)
         return x_global, x_local
 
-        # return x
-
-
 class LayerNorm(nn.LayerNorm):
     """Subclass torch's LayerNorm to handle fp16."""
 
@@ -441,12 +414,9 @@ class LayerNorm(nn.LayerNorm):
         ret = super().forward(x.type(torch.float32))
         return ret.type(orig_type)
 
-
 class QuickGELU(nn.Module):
     def forward(self, x: torch.Tensor):
         return x * torch.sigmoid(1.702 * x)
-
-
 
 class CustomMultiheadAttention(nn.Module):
     def __init__(self, embed_dim, num_heads, dropout=0.0):
@@ -1147,7 +1117,6 @@ class CLIP(nn.Module):
         # shape = [global_batch_size, global_batch_size]
         return logits_per_image, logits_per_text
 
-
 def convert_weights(model: nn.Module):
     """Convert applicable model parameters to fp16"""
 
@@ -1170,7 +1139,6 @@ def convert_weights(model: nn.Module):
                     attr.data = attr.data.half()
 
     model.apply(_convert_weights_to_fp16)
-
 
 def build_model(state_dict: dict, use_adapter=True, adapter_pos='all', adapter_num_layers=1, pt_attn: str="none", pt_learn=0, pt_lyr=0):
     vit = "visual.proj" in state_dict

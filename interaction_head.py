@@ -1,11 +1,6 @@
-"""
-Interaction head and its submodules
-
-Fred Zhang <frederic.zhang@anu.edu.au>
-
-The Australian National University
-Australian Centre for Robotic Vision
-"""
+#【大脑】 这是最关键的文件之一。
+# 它定义了怎么计算分类 Score，怎么做特征融合
+# 以及特征分解（Decomposition）和正则化（Regularization）
 
 import torch
 import torch.nn.functional as F
