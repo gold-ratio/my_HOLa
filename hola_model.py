@@ -776,10 +776,31 @@ class UPT(nn.Module):
 
             if self.pt_init == 'pos+detr+fus':
                 self.pt_token_fus = Adapter(256, mem_adpt_self = False, SA_only=False, prior_dim=36)
+                # Learnable gate to weigh human/object embeddings per pair
+                self.ho_gate_mlp = nn.Sequential(
+                    nn.Linear(256 * 2 + 36, 128),
+                    nn.ReLU(),
+                    nn.Linear(128, 1)
+                )
+                # Initialize last layer bias to 0 so sigmoid -> 0.5 initially
+                with torch.no_grad():
+                    self.ho_gate_mlp[-1].bias.fill_(0.)
             else:
                 self.pt_posenc_head = nn.Sequential(
                     nn.Linear(36, 128), nn.ReLU(),
                     nn.Linear(128, 256), nn.ReLU())
+                # Enhancements for 'pos+detr' HOI token fusion
+                # Learnable per-channel weights for ho vs spatial
+                self.hoi_pd_alpha = nn.Parameter(torch.ones(256))
+                self.hoi_pd_beta = nn.Parameter(torch.ones(256))
+                # Small MLP to produce a residual fusion signal from [ho, spatial]
+                self.hoi_pd_fuse = nn.Sequential(
+                    nn.Linear(256 * 2, 256),
+                    nn.GELU(),
+                    nn.Linear(256, 256)
+                )
+                self.hoi_pd_ln = LayerNorm(256)
+                self.hoi_pd_dropout = nn.Dropout(p=0.1)
 
     def positional_encoding(self, seq_len, d_model):
         """ 
@@ -1295,12 +1316,20 @@ class UPT(nn.Module):
             obji_HO_pair_text_embeddings = [self.HO_pair_prior_text_embeddings[i].to(pairwise_spatial.device) for i in labels[y_keep].tolist()]
             object_embs = self.object_embedding.to(pairwise_spatial.device)[torch.tensor(labels[y_keep])]
             
-            if self.pt_init == 'pos+detr':
+            if self.pt_init == 'learnable':
                 spatial_embeddings = self.pt_posenc_head(pairwise_spatial)
-                # HOI_token = (embeds[x_keep] + embeds[y_keep])/2 + spatial_embeddings
-                HOI_token = ho_embed + spatial_embeddings
+                # Enhanced fusion: learnable per-channel weighting + residual MLP with LN
+                weighted = self.hoi_pd_alpha * ho_embed + self.hoi_pd_beta * spatial_embeddings
+                fuse_in = torch.cat([ho_embed, spatial_embeddings], dim=-1)
+                residual = self.hoi_pd_fuse(fuse_in)
+                HOI_token = self.hoi_pd_ln(weighted + self.hoi_pd_dropout(residual))
             elif self.pt_init == 'pos+detr+fus':
-                HOI_token = self.pt_token_fus((embeds[x_keep]+ embeds[y_keep]).unsqueeze(0)/2, pairwise_spatial.unsqueeze(0)).squeeze(0)
+                # Learnable gate: decide human vs object contribution per pair
+                # Inputs: human/object embeddings (256 each) + spatial (36) -> gate in (0,1)
+                _pair_q = torch.cat([embeds[x_keep], embeds[y_keep], pairwise_spatial], dim=-1)
+                _gate = torch.sigmoid(self.ho_gate_mlp(_pair_q))  # [num_pairs, 1]
+                _pair_embed = _gate * embeds[x_keep] + (1 - _gate) * embeds[y_keep]
+                HOI_token = self.pt_token_fus(_pair_embed.unsqueeze(0), pairwise_spatial.unsqueeze(0)).squeeze(0)
             HOI_tokens.append(HOI_token)
             paired_priors_orig.append([torch.cat((pr_txt_i, object_embs[idx].unsqueeze(0))) for idx, pr_txt_i in enumerate(obji_HO_pair_text_embeddings)]) ### batch * HO-num * prior-num * dim
 
@@ -1587,6 +1616,24 @@ class UPT(nn.Module):
                             loss_dict = dict(interaction_loss=interaction_loss, sem_loss = (relation_ho_cls_seen)*self.semloss_weight)
                 else:
                     loss_dict = dict(interaction_loss=interaction_loss)
+
+                # Monitoring: alpha/beta stats (for 'pos+detr' enhanced fusion)
+                with torch.no_grad():
+                    if hasattr(self, 'hoi_pd_alpha') and hasattr(self, 'hoi_pd_beta'):
+                        a = self.hoi_pd_alpha.detach().flatten()
+                        b = self.hoi_pd_beta.detach().flatten()
+                        # Scalars for TensorBoard
+                        loss_dict['alpha_mean'] = a.mean()
+                        loss_dict['alpha_std'] = a.std(unbiased=False)
+                        loss_dict['alpha_min'] = a.min()
+                        loss_dict['alpha_max'] = a.max()
+                        loss_dict['beta_mean'] = b.mean()
+                        loss_dict['beta_std'] = b.std(unbiased=False)
+                        loss_dict['beta_min'] = b.min()
+                        loss_dict['beta_max'] = b.max()
+                        # 1D tensors for histogram logging
+                        loss_dict['alpha_values'] = a
+                        loss_dict['beta_values'] = b
                 
                 if interaction_loss.isnan():
                     pdb.set_trace()

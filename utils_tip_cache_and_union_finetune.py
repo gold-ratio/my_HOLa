@@ -326,9 +326,17 @@ class CustomisedDLE(DistributedLearningEngine):
     def _on_each_iteration(self):
         # with amp.autocast(enabled=True):
         loss_dict = self._state.net(*self._state.inputs, targets=self._state.targets)
-        if torch.isnan(torch.tensor(list(loss_dict.values()))).any():
+        # Check NaN on scalar losses only (avoid hist tensors)
+        scalar_vals = [v for v in loss_dict.values() if torch.is_tensor(v) and v.dim()==0]
+        if len(scalar_vals)>0 and torch.isnan(torch.stack([v for v in scalar_vals])).any():
             raise ValueError(f"The HOI loss is NaN for rank {self._rank}")
-        self._state.loss = sum(loss for loss in loss_dict.values())
+        # Sum only true loss terms: tensors that require gradients
+        loss_terms = [v for v in loss_dict.values() if torch.is_tensor(v) and v.requires_grad]
+        if len(loss_terms) > 0:
+            self._state.loss = sum(loss_terms)
+        else:
+            param_device = next(self._state.net.parameters()).device
+            self._state.loss = torch.tensor(0., device=param_device)
         # print("final loss ", self._state.loss, epoch, self._start_epoch)
         self._state.optimizer.zero_grad(set_to_none=True)
         self._state.loss.backward()
@@ -341,11 +349,17 @@ class CustomisedDLE(DistributedLearningEngine):
         if self.writer is not None and self._rank == 0:
             for k, v in loss_dict.items():
                 if torch.is_tensor(v):
-                    self.writer.add_scalar(
-                        f'Loss/{k}',
-                        v.item(),
-                        self.global_step
-                    )
+                    if v.dim() == 0:
+                        self.writer.add_scalar(
+                            f'Loss/{k}',
+                            v.item(),
+                            self.global_step
+                        )
+                    elif v.dim() == 1:
+                        # Log distributions (e.g., alpha_values/beta_values)
+                        self.writer.add_histogram(
+                            f'Dist/{k}', v.detach().cpu(), self.global_step
+                        )
 
             self.writer.add_scalar(
                 'Loss/total',
@@ -359,8 +373,9 @@ class CustomisedDLE(DistributedLearningEngine):
         # 控制台打印训练进度
         # ===============================
         if self._rank == 0 and self.global_step % 50 == 0:  # 每50步打印一次
+            display_items = [f"{k}: {v.item():.4f}" for k, v in loss_dict.items() if torch.is_tensor(v) and v.dim()==0]
             print(f"[Step {self.global_step}] Loss total: {self._state.loss.item():.4f}, "
-                  + ", ".join([f"{k}: {v.item():.4f}" for k, v in loss_dict.items()])
+                  + ", ".join(display_items)
                   + f", LR: {lr:.6f}")
 
         self.global_step += 1

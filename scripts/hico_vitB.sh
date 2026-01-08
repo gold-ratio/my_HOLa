@@ -1,10 +1,10 @@
 CUDA_VISIBLE_DEVICES=0 python main_tip_finetune.py --world-size 1 \
-    --pretrained checkpoints/detr-r50-hicodet.pth \
-    --output-dir checkpoints/hico_HO_adpt_uv_512_clipbase/hola \
+    --pretrained /root/autodl-tmp/checkpoints/detr-r50-hicodet.pth \
+    --output-dir /root/autodl-tmp/checkpoints/hico_HO_adpt_uv_512_clipbase/hola \
     --num_classes 117 \
     --use_multi_hot \
     --file1 hicodet_pkl_files/union_embeddings_cachemodel_crop_padding_zeros_vitb16.p \
-    --clip_dir_vit checkpoints/pretrained_clip/ViT-B-16.pt \
+    --clip_dir_vit /root/autodl-tmp/checkpoints/pretrained_clip/ViT-B-16.pt \
     --port 1235 \
     --logits_type "HO+U"  \
     --llmtxt   \
@@ -27,19 +27,20 @@ CUDA_VISIBLE_DEVICES=0 python main_tip_finetune.py --world-size 1 \
     --ho_pair_pt \
     --ho_pair_prior 1 \
     --pred_type  'ho+u+l' \
-    --pt_init 'pos+detr' \
+    --pt_init 'learnable' \
     --pt_attn 'uniform'
 
+#测评
 CUDA_VISIBLE_DEVICES=0 python main_tip_finetune.py --world-size 1 \
   --dataset hicodet \
   --data-root hicodet/ \
   --partitions train2015 test2015 \
-  --pretrained checkpoints/detr-r50-hicodet.pth \
-  --output-dir checkpoints/hico_HO_adpt_uv_512_clipbase/hola \
+  --pretrained /root/autodl-tmp/checkpoints/detr-r50-hicodet.pth \
+  --output-dir /root/autodl-tmp/checkpoints/hico_HO_adpt_uv_512_clipbase/hola \
   --num_classes 117 \
   --use_multi_hot \
   --file1 hicodet_pkl_files/union_embeddings_cachemodel_crop_padding_zeros_vitb16.p \
-  --clip_dir_vit checkpoints/pretrained_clip/ViT-B-16.pt \
+  --clip_dir_vit /root/autodl-tmp/checkpoints/pretrained_clip/ViT-B-16.pt \
   --logits_type "HO+U" \
   --llmtxt \
   --wo_unseen_pred \
@@ -61,7 +62,7 @@ CUDA_VISIBLE_DEVICES=0 python main_tip_finetune.py --world-size 1 \
   --ho_pair_pt \
   --ho_pair_prior 1 \
   --pred_type ho+u+l \
-  --pt_init pos+detr \
+  --pt_init learnable \
   --pt_attn uniform \
   --eval \
-  --resume checkpoints/hico_HO_adpt_uv_512_clipbase/hola/ckpt_22220_10.pt
+  --resume /root/autodl-tmp/checkpoints/hico_HO_adpt_uv_512_clipbase/hola/ckpt_22220_10.pt

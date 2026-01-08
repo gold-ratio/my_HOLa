@@ -478,7 +478,7 @@ if __name__ == '__main__':
     #### human-object tokens
     parser.add_argument('--ho_pair_pt', default=False, action='store_true')
     parser.add_argument('--ho_pair_prior', default=0, type=int)
-    parser.add_argument('--pt_init', default='pos+detr+fus', choices=['pos', 'detr', 'pos+detr', 'pos+detr+fus'])
+    parser.add_argument('--pt_init', default='pos+detr+fus')#删除选择choice
     parser.add_argument('--pred_type', type=str, default='ho+u', choices=['ho', 'u', 'l','ho+u', 'ho+l', 'u+l', 'ho+u+l'])
     parser.add_argument('--pt_attn',  type=str, default='uniform', choices=['mask', 'uniform'])
     args = parser.parse_args()
